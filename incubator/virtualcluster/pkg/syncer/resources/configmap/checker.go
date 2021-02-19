@@ -1,5 +1,5 @@
 /*
-Copyright 2019 The Kubernetes Authors.
+Copyright 2021 The Kubernetes Authors.
  Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -24,6 +24,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog"
 
@@ -31,6 +32,7 @@ import (
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/conversion"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/metrics"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/patrol/differ"
+	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/util"
 )
 
 var numMissMatchedConfigMaps uint64
@@ -41,14 +43,14 @@ func (c *controller) StartPatrol(stopCh <-chan struct{}) error {
 	if !cache.WaitForCacheSync(stopCh, c.configMapSynced) {
 		return fmt.Errorf("failed to wait for caches to sync before starting ConfigMap checker")
 	}
-	c.configMapPatroller.Start(stopCh)
+	c.Patroller.Start(stopCh)
 	return nil
 }
 
 // PatrollerDo checks to see if configmaps in super master informer cache and tenant master
 // keep consistency.
 func (c *controller) PatrollerDo() {
-	clusterNames := c.multiClusterConfigMapController.GetClusterNames()
+	clusterNames := c.MultiClusterController.GetClusterNames()
 	if len(clusterNames) == 0 {
 		klog.Infof("tenant masters has no clusters, give up period checker")
 		return
@@ -64,11 +66,13 @@ func (c *controller) PatrollerDo() {
 		pSet.Insert(differ.ClusterObject{Object: pCM, Key: differ.DefaultClusterObjectKey(pCM, "")})
 	}
 
+	blockedClusterSet := sets.NewString()
 	vSet := differ.NewDiffSet()
 	for _, cluster := range clusterNames {
-		listObj, err := c.multiClusterConfigMapController.List(cluster)
+		listObj, err := c.MultiClusterController.List(cluster)
 		if err != nil {
 			klog.Errorf("error listing configmaps from cluster %s informer cache: %v", cluster, err)
+			blockedClusterSet.Insert(cluster)
 			continue
 		}
 		cmList := listObj.(*v1.ConfigMapList)
@@ -83,7 +87,7 @@ func (c *controller) PatrollerDo() {
 
 	configMapDiffer := differ.HandlerFuncs{}
 	configMapDiffer.AddFunc = func(vObj differ.ClusterObject) {
-		if err := c.multiClusterConfigMapController.RequeueObject(vObj.OwnerCluster, vObj.Object); err != nil {
+		if err := c.MultiClusterController.RequeueObject(vObj.OwnerCluster, vObj.Object); err != nil {
 			klog.Errorf("error requeue vConfigMap %v/%v in cluster %s: %v", vObj.GetNamespace(), vObj.GetName(), vObj.GetOwnerCluster(), err)
 		} else {
 			metrics.CheckerRemedyStats.WithLabelValues("RequeuedTenantConfigMaps").Inc()
@@ -98,12 +102,12 @@ func (c *controller) PatrollerDo() {
 			configMapDiffer.OnDelete(pObj)
 			return
 		}
-		spec, err := c.multiClusterConfigMapController.GetSpec(vObj.GetOwnerCluster())
+		vc, err := util.GetVirtualClusterObject(c.MultiClusterController, vObj.GetOwnerCluster())
 		if err != nil {
 			klog.Errorf("fail to get cluster spec : %s", vObj.GetOwnerCluster())
 			return
 		}
-		updated := conversion.Equality(c.config, spec).CheckConfigMapEquality(pCM, vCM)
+		updated := conversion.Equality(c.Config, vc).CheckConfigMapEquality(pCM, vCM)
 		if updated != nil {
 			atomic.AddUint64(&numMissMatchedConfigMaps, 1)
 			klog.Warningf("ConfigMap %s diff in super&tenant master", pObj.Key)
@@ -121,7 +125,7 @@ func (c *controller) PatrollerDo() {
 
 	vSet.Difference(pSet, differ.FilteringHandler{
 		Handler:    configMapDiffer,
-		FilterFunc: differ.DefaultDifferFilter,
+		FilterFunc: differ.DefaultDifferFilter(blockedClusterSet),
 	})
 
 	metrics.CheckerMissMatchStats.WithLabelValues("MissMatchedConfigMaps").Set(float64(numMissMatchedConfigMaps))

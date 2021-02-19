@@ -1,5 +1,5 @@
 /*
-Copyright 2019 The Kubernetes Authors.
+Copyright 2021 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -33,6 +33,7 @@ import (
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/constants"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/conversion"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/metrics"
+	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/util"
 )
 
 var numSpecMissMatchedServices uint64
@@ -43,14 +44,14 @@ func (c *controller) StartPatrol(stopCh <-chan struct{}) error {
 	if !cache.WaitForCacheSync(stopCh, c.serviceSynced) {
 		return fmt.Errorf("failed to wait for caches to sync before starting Service checker")
 	}
-	c.servicePatroller.Start(stopCh)
+	c.Patroller.Start(stopCh)
 	return nil
 }
 
 // PatrollerDo check if services keep consistency between super
 // master and tenant masters.
 func (c *controller) PatrollerDo() {
-	clusterNames := c.multiClusterServiceController.GetClusterNames()
+	clusterNames := c.MultiClusterController.GetClusterNames()
 	if len(clusterNames) == 0 {
 		klog.Infof("tenant masters has no clusters, give up period checker")
 		return
@@ -82,7 +83,7 @@ func (c *controller) PatrollerDo() {
 			continue
 		}
 		shouldDelete := false
-		vServiceObj, err := c.multiClusterServiceController.Get(clusterName, vNamespace, pService.Name)
+		vServiceObj, err := c.MultiClusterController.Get(clusterName, vNamespace, pService.Name)
 		if errors.IsNotFound(err) {
 			shouldDelete = true
 		}
@@ -109,7 +110,7 @@ func (c *controller) PatrollerDo() {
 }
 
 func (c *controller) checkServicesOfTenantCluster(clusterName string) {
-	listObj, err := c.multiClusterServiceController.List(clusterName)
+	listObj, err := c.MultiClusterController.List(clusterName)
 	if err != nil {
 		klog.Errorf("error listing services from cluster %s informer cache: %v", clusterName, err)
 		return
@@ -120,7 +121,7 @@ func (c *controller) checkServicesOfTenantCluster(clusterName string) {
 		targetNamespace := conversion.ToSuperMasterNamespace(clusterName, vService.Namespace)
 		pService, err := c.serviceLister.Services(targetNamespace).Get(vService.Name)
 		if errors.IsNotFound(err) {
-			if err := c.multiClusterServiceController.RequeueObject(clusterName, &svcList.Items[i]); err != nil {
+			if err := c.MultiClusterController.RequeueObject(clusterName, &svcList.Items[i]); err != nil {
 				klog.Errorf("error requeue vservice %v/%v in cluster %s: %v", vService.Namespace, vService.Name, clusterName, err)
 			} else {
 				metrics.CheckerRemedyStats.WithLabelValues("RequeuedTenantServices").Inc()
@@ -138,16 +139,16 @@ func (c *controller) checkServicesOfTenantCluster(clusterName string) {
 			continue
 		}
 
-		spec, err := c.multiClusterServiceController.GetSpec(clusterName)
+		vc, err := util.GetVirtualClusterObject(c.MultiClusterController, clusterName)
 		if err != nil {
 			klog.Errorf("fail to get cluster spec : %s", clusterName)
 			continue
 		}
-		updatedService := conversion.Equality(c.config, spec).CheckServiceEquality(pService, &svcList.Items[i])
+		updatedService := conversion.Equality(c.Config, vc).CheckServiceEquality(pService, &svcList.Items[i])
 		if updatedService != nil {
 			atomic.AddUint64(&numSpecMissMatchedServices, 1)
 			klog.Warningf("spec of service %v/%v diff in super&tenant master", vService.Namespace, vService.Name)
-			if err := c.multiClusterServiceController.RequeueObject(clusterName, &svcList.Items[i]); err != nil {
+			if err := c.MultiClusterController.RequeueObject(clusterName, &svcList.Items[i]); err != nil {
 				klog.Errorf("error requeue vservice %v/%v in cluster %s: %v", vService.Namespace, vService.Name, clusterName, err)
 			} else {
 				metrics.CheckerRemedyStats.WithLabelValues("RequeuedTenantServices").Inc()
@@ -155,7 +156,7 @@ func (c *controller) checkServicesOfTenantCluster(clusterName string) {
 		}
 		if isBackPopulateService(pService) {
 			enqueue := false
-			updatedMeta := conversion.Equality(c.config, spec).CheckUWObjectMetaEquality(&pService.ObjectMeta, &svcList.Items[i].ObjectMeta)
+			updatedMeta := conversion.Equality(c.Config, vc).CheckUWObjectMetaEquality(&pService.ObjectMeta, &svcList.Items[i].ObjectMeta)
 			if updatedMeta != nil {
 				atomic.AddUint64(&numUWMetaMissMatchedServices, 1)
 				enqueue = true

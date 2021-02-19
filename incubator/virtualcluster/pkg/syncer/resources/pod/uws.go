@@ -1,5 +1,5 @@
 /*
-Copyright 2019 The Kubernetes Authors.
+Copyright 2021 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -30,8 +30,9 @@ import (
 
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/constants"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/conversion"
-	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/reconciler"
+	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/util"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/vnode"
+	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/reconciler"
 )
 
 // StartUWS starts the upward syncer
@@ -40,7 +41,7 @@ func (c *controller) StartUWS(stopCh <-chan struct{}) error {
 	if !cache.WaitForCacheSync(stopCh, c.podSynced, c.serviceSynced) {
 		return fmt.Errorf("failed to wait for caches to sync")
 	}
-	return c.upwardPodController.Start(stopCh)
+	return c.UpwardController.Start(stopCh)
 }
 
 func (c *controller) BackPopulate(key string) error {
@@ -64,7 +65,7 @@ func (c *controller) BackPopulate(key string) error {
 		return nil
 	}
 
-	vPodObj, err := c.multiClusterPodController.Get(clusterName, vNamespace, pName)
+	vPodObj, err := c.MultiClusterController.Get(clusterName, vNamespace, pName)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			return nil
@@ -76,7 +77,7 @@ func (c *controller) BackPopulate(key string) error {
 		return fmt.Errorf("BackPopulated pPod %s/%s delegated UID is different from updated object.", pPod.Namespace, pPod.Name)
 	}
 
-	tenantClient, err := c.multiClusterPodController.GetClusterClient(clusterName)
+	tenantClient, err := c.MultiClusterController.GetClusterClient(clusterName)
 	if err != nil {
 		return pkgerr.Wrapf(err, "failed to create client from cluster %s config", clusterName)
 	}
@@ -99,7 +100,7 @@ func (c *controller) BackPopulate(key string) error {
 			return err
 		}
 
-		if _, err := c.multiClusterPodController.GetByObjectType(clusterName, "", n.GetName(), &v1.Node{}); err != nil {
+		if _, err := c.MultiClusterController.GetByObjectType(clusterName, "", n.GetName(), &v1.Node{}); err != nil {
 			// check if target node has already registered on the vc
 			// before creating
 			if !errors.IsNotFound(err) {
@@ -135,7 +136,7 @@ func (c *controller) BackPopulate(key string) error {
 		}
 	} else {
 		// Check if the vNode exists in Tenant master.
-		if _, err := c.multiClusterPodController.GetByObjectType(clusterName, "", vPod.Spec.NodeName, &v1.Node{}); err != nil {
+		if _, err := c.MultiClusterController.GetByObjectType(clusterName, "", vPod.Spec.NodeName, &v1.Node{}); err != nil {
 			if errors.IsNotFound(err) {
 				// We have consistency issue here, do not fix for now. TODO: add to metrics
 			}
@@ -143,13 +144,13 @@ func (c *controller) BackPopulate(key string) error {
 		}
 	}
 
-	spec, err := c.multiClusterPodController.GetSpec(clusterName)
+	vc, err := util.GetVirtualClusterObject(c.MultiClusterController, clusterName)
 	if err != nil {
 		return err
 	}
 
 	var newPod *v1.Pod
-	updatedMeta := conversion.Equality(c.config, spec).CheckUWObjectMetaEquality(&pPod.ObjectMeta, &vPod.ObjectMeta)
+	updatedMeta := conversion.Equality(c.Config, vc).CheckUWObjectMetaEquality(&pPod.ObjectMeta, &vPod.ObjectMeta)
 	if updatedMeta != nil {
 		newPod = vPod.DeepCopy()
 		newPod.ObjectMeta = *updatedMeta
@@ -158,7 +159,7 @@ func (c *controller) BackPopulate(key string) error {
 		}
 	}
 
-	if newStatus := conversion.Equality(c.config, spec).CheckUWPodStatusEquality(pPod, vPod); newStatus != nil {
+	if newStatus := conversion.Equality(c.Config, vc).CheckUWPodStatusEquality(pPod, vPod); newStatus != nil {
 		if newPod == nil {
 			newPod = vPod.DeepCopy()
 		} else {

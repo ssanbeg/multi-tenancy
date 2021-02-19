@@ -17,7 +17,6 @@ limitations under the License.
 package node
 
 import (
-	"fmt"
 	"sync"
 
 	v1 "k8s.io/api/core/v1"
@@ -27,20 +26,30 @@ import (
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
 	listersv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/klog"
 
 	vcclient "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/client/clientset/versioned"
 	vcinformers "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/client/informers/externalversions/tenancy/v1alpha1"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/apis/config"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/constants"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/manager"
-	mc "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/mccontroller"
 	uw "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/uwcontroller"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/vnode"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/vnode/native"
+	mc "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/mccontroller"
+	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/plugin"
 )
 
+func init() {
+	plugin.SyncerResourceRegister.Register(&plugin.Registration{
+		ID: "node",
+		InitFn: func(ctx *plugin.InitContext) (interface{}, error) {
+			return NewNodeController(ctx.Config.(*config.SyncerConfiguration), ctx.Client, ctx.Informer, ctx.VCClient, ctx.VCInformer, manager.ResourceSyncerOptions{})
+		},
+	})
+}
+
 type controller struct {
+	manager.BaseResourceSyncer
 	// lock to protect nodeNameToCluster
 	sync.Mutex
 	// phyical node to tenant cluster map. A physical node can be presented as virtual node in multiple tenant clusters.
@@ -48,13 +57,9 @@ type controller struct {
 	// super master node client
 	nodeClient v1core.NodesGetter
 	// super master node lister/synced function
-	nodeLister listersv1.NodeLister
-	nodeSynced cache.InformerSynced
-	// Connect to all tenant master node informers
-	multiClusterNodeController *mc.MultiClusterController
-	// UWcontroller
-	upwardNodeController *uw.UpwardController
-	vnodeProvider        vnode.VirtualNodeProvider
+	nodeLister    listersv1.NodeLister
+	nodeSynced    cache.InformerSynced
+	vnodeProvider vnode.VirtualNodeProvider
 }
 
 func NewNodeController(config *config.SyncerConfiguration,
@@ -62,44 +67,34 @@ func NewNodeController(config *config.SyncerConfiguration,
 	informer informers.SharedInformerFactory,
 	vcClient vcclient.Interface,
 	vcInformer vcinformers.VirtualClusterInformer,
-	options *manager.ResourceSyncerOptions) (manager.ResourceSyncer, *mc.MultiClusterController, *uw.UpwardController, error) {
+	options manager.ResourceSyncerOptions) (manager.ResourceSyncer, error) {
 	c := &controller{
+		BaseResourceSyncer: manager.BaseResourceSyncer{
+			Config: config,
+		},
 		nodeNameToCluster: make(map[string]map[string]struct{}),
 		nodeClient:        client.CoreV1(),
 		vnodeProvider:     native.NewNativeVirtualNodeProvider(config.VNAgentPort),
 	}
 
-	var mcOptions *mc.Options
-	if options == nil || options.MCOptions == nil {
-		mcOptions = &mc.Options{Reconciler: c}
-	} else {
-		mcOptions = options.MCOptions
-	}
-	mcOptions.MaxConcurrentReconciles = constants.DwsControllerWorkerLow
-	multiClusterNodeController, err := mc.NewMCController("tenant-masters-node-controller", &v1.Node{}, *mcOptions)
+	var err error
+	c.MultiClusterController, err = mc.NewMCController(&v1.Node{}, &v1.NodeList{}, c, mc.WithOptions(options.MCOptions))
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to create node mc controller: %v", err)
+		return nil, err
 	}
-	c.multiClusterNodeController = multiClusterNodeController
+
 	c.nodeLister = informer.Core().V1().Nodes().Lister()
-	if options != nil && options.IsFake {
+	if options.IsFake {
 		c.nodeSynced = func() bool { return true }
 	} else {
 		c.nodeSynced = informer.Core().V1().Nodes().Informer().HasSynced
 	}
 
-	var uwOptions *uw.Options
-	if options == nil || options.UWOptions == nil {
-		uwOptions = &uw.Options{Reconciler: c}
-	} else {
-		uwOptions = options.UWOptions
-	}
-	uwOptions.MaxConcurrentReconciles = constants.UwsControllerWorkerHigh
-	upwardNodeController, err := uw.NewUWController("node-upward-controller", &v1.Node{}, *uwOptions)
+	c.UpwardController, err = uw.NewUWController(&v1.Node{}, c,
+		uw.WithMaxConcurrentReconciles(constants.UwsControllerWorkerHigh), uw.WithOptions(options.UWOptions))
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to create node upward controller: %v", err)
+		return nil, err
 	}
-	c.upwardNodeController = upwardNodeController
 
 	informer.Core().V1().Nodes().Informer().AddEventHandler(
 		cache.ResourceEventHandlerFuncs{
@@ -122,31 +117,11 @@ func NewNodeController(config *config.SyncerConfiguration,
 			DeleteFunc: c.enqueueNode,
 		},
 	)
-	return c, multiClusterNodeController, upwardNodeController, nil
+	return c, nil
 }
 
 func (c *controller) SetVNodeProvider(provider vnode.VirtualNodeProvider) {
 	c.Lock()
 	c.vnodeProvider = provider
 	c.Unlock()
-}
-
-func (c *controller) StartPatrol(stopCh <-chan struct{}) error {
-	return nil
-}
-
-func (c *controller) PatrollerDo() {
-}
-
-func (c *controller) AddCluster(cluster mc.ClusterInterface) {
-	klog.Infof("tenant-masters-node-controller watch cluster %s for node resource", cluster.GetClusterName())
-	err := c.multiClusterNodeController.WatchClusterResource(cluster, mc.WatchOptions{})
-	if err != nil {
-		klog.Errorf("failed to watch cluster %s node event: %v", cluster.GetClusterName(), err)
-	}
-}
-
-func (c *controller) RemoveCluster(cluster mc.ClusterInterface) {
-	klog.Infof("tenant-masters-node-controller stop watching cluster %s for node resource", cluster.GetClusterName())
-	c.multiClusterNodeController.TeardownClusterResource(cluster)
 }

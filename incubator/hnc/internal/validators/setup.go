@@ -25,7 +25,7 @@ const (
 var dnsName = fmt.Sprintf("%s.%s.svc", serviceName, secretNamespace)
 
 // CreateCertsIfNeeded creates all certs for webhooks. This function is called from main.go.
-func CreateCertsIfNeeded(mgr ctrl.Manager, novalidation, internalCert bool) (chan struct{}, error) {
+func CreateCertsIfNeeded(mgr ctrl.Manager, novalidation, internalCert, restartOnSecretRefresh bool) (chan struct{}, error) {
 	setupFinished := make(chan struct{})
 	if novalidation || !internalCert {
 		close(setupFinished)
@@ -42,7 +42,11 @@ func CreateCertsIfNeeded(mgr ctrl.Manager, novalidation, internalCert bool) (cha
 		CAOrganization: caOrganization,
 		DNSName:        dnsName,
 		IsReady:        setupFinished,
-		VWHName:        vwhName,
+		Webhooks: []cert.WebhookInfo{{
+			Type: cert.Validating,
+			Name: vwhName,
+		}},
+		RestartOnSecretRefresh: restartOnSecretRefresh,
 	})
 }
 

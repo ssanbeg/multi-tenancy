@@ -26,32 +26,35 @@ import (
 	v1beta1extensions "k8s.io/client-go/kubernetes/typed/extensions/v1beta1"
 	listersv1beta1 "k8s.io/client-go/listers/extensions/v1beta1"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/klog"
 
 	vcclient "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/client/clientset/versioned"
 	vcinformers "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/client/informers/externalversions/tenancy/v1alpha1"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/apis/config"
-	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/constants"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/conversion"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/manager"
-	mc "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/mccontroller"
 	pa "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/patrol"
 	uw "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/uwcontroller"
+	mc "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/mccontroller"
+	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/plugin"
 )
 
+func init() {
+	plugin.SyncerResourceRegister.Register(&plugin.Registration{
+		ID: "ingress",
+		InitFn: func(ctx *plugin.InitContext) (interface{}, error) {
+			return NewIngressController(ctx.Config.(*config.SyncerConfiguration), ctx.Client, ctx.Informer, ctx.VCClient, ctx.VCInformer, manager.ResourceSyncerOptions{})
+		},
+		Disable: true,
+	})
+}
+
 type controller struct {
-	config *config.SyncerConfiguration
+	manager.BaseResourceSyncer
 	// super master ingress client
 	ingressClient v1beta1extensions.IngressesGetter
 	// super master informer/listers/synced functions
 	ingressLister listersv1beta1.IngressLister
 	ingressSynced cache.InformerSynced
-	// Connect to all tenant master ingress informers
-	multiClusterIngressController *mc.MultiClusterController
-	// UWcontroller
-	upwardIngressController *uw.UpwardController
-	// Periodic checker
-	ingressPatroller *pa.Patroller
 }
 
 func NewIngressController(config *config.SyncerConfiguration,
@@ -59,55 +62,36 @@ func NewIngressController(config *config.SyncerConfiguration,
 	informer informers.SharedInformerFactory,
 	vcClient vcclient.Interface,
 	vcInformer vcinformers.VirtualClusterInformer,
-	options *manager.ResourceSyncerOptions) (manager.ResourceSyncer, *mc.MultiClusterController, *uw.UpwardController, error) {
+	options manager.ResourceSyncerOptions) (manager.ResourceSyncer, error) {
 	c := &controller{
-		config:        config,
+		BaseResourceSyncer: manager.BaseResourceSyncer{
+			Config: config,
+		},
 		ingressClient: client.ExtensionsV1beta1(),
 	}
-	var mcOptions *mc.Options
-	if options == nil || options.MCOptions == nil {
-		mcOptions = &mc.Options{Reconciler: c}
-	} else {
-		mcOptions = options.MCOptions
-	}
-	mcOptions.MaxConcurrentReconciles = constants.DwsControllerWorkerLow
-	multiClusterIngressController, err := mc.NewMCController("tenant-masters-ingress-controller", &v1beta1.Ingress{}, *mcOptions)
+
+	var err error
+	c.MultiClusterController, err = mc.NewMCController(&v1beta1.Ingress{}, &v1beta1.IngressList{}, c, mc.WithOptions(options.MCOptions))
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to create ingress mc controller: %v", err)
+		return nil, err
 	}
-	c.multiClusterIngressController = multiClusterIngressController
 
 	c.ingressLister = informer.Extensions().V1beta1().Ingresses().Lister()
-	if options != nil && options.IsFake {
+	if options.IsFake {
 		c.ingressSynced = func() bool { return true }
 	} else {
 		c.ingressSynced = informer.Extensions().V1beta1().Ingresses().Informer().HasSynced
 	}
 
-	var uwOptions *uw.Options
-	if options == nil || options.UWOptions == nil {
-		uwOptions = &uw.Options{Reconciler: c}
-	} else {
-		uwOptions = options.UWOptions
-	}
-	uwOptions.MaxConcurrentReconciles = constants.UwsControllerWorkerLow
-	upwardIngressController, err := uw.NewUWController("ingress-upward-controller", &v1beta1.Ingress{}, *uwOptions)
+	c.UpwardController, err = uw.NewUWController(&v1beta1.Ingress{}, c, uw.WithOptions(options.UWOptions))
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to create ingress upward controller: %v", err)
+		return nil, err
 	}
-	c.upwardIngressController = upwardIngressController
 
-	var patrolOptions *pa.Options
-	if options == nil || options.PatrolOptions == nil {
-		patrolOptions = &pa.Options{Reconciler: c}
-	} else {
-		patrolOptions = options.PatrolOptions
-	}
-	ingressPatroller, err := pa.NewPatroller("ingress-patroller", &v1beta1.Ingress{}, *patrolOptions)
+	c.Patroller, err = pa.NewPatroller(&v1beta1.Ingress{}, c, pa.WithOptions(options.PatrolOptions))
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to create ingress patroller: %v", err)
+		return nil, err
 	}
-	c.ingressPatroller = ingressPatroller
 
 	informer.Extensions().V1beta1().Ingresses().Informer().AddEventHandler(
 		cache.FilteringResourceEventHandler{
@@ -138,7 +122,7 @@ func NewIngressController(config *config.SyncerConfiguration,
 				DeleteFunc: c.enqueueIngress,
 			},
 		})
-	return c, multiClusterIngressController, upwardIngressController, nil
+	return c, nil
 }
 
 func (c *controller) enqueueIngress(obj interface{}) {
@@ -157,18 +141,5 @@ func (c *controller) enqueueIngress(obj interface{}) {
 		utilruntime.HandleError(fmt.Errorf("couldn't get key for object %v: %v", obj, err))
 		return
 	}
-	c.upwardIngressController.AddToQueue(key)
-}
-
-func (c *controller) AddCluster(cluster mc.ClusterInterface) {
-	klog.Infof("tenant-masters-ingress-controller watch cluster %s for ingress resource", cluster.GetClusterName())
-	err := c.multiClusterIngressController.WatchClusterResource(cluster, mc.WatchOptions{})
-	if err != nil {
-		klog.Errorf("failed to watch cluster %s ingress event: %v", cluster.GetClusterName(), err)
-	}
-}
-
-func (c *controller) RemoveCluster(cluster mc.ClusterInterface) {
-	klog.Infof("tenant-masters-ingress-controller stop watching cluster %s for ingress resource", cluster.GetClusterName())
-	c.multiClusterIngressController.TeardownClusterResource(cluster)
+	c.UpwardController.AddToQueue(key)
 }

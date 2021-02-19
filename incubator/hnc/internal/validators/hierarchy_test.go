@@ -18,7 +18,7 @@ import (
 func TestStructure(t *testing.T) {
 	f := foresttest.Create("-a-") // a <- b; c
 	h := &Hierarchy{Forest: f}
-	l := zap.Logger(false)
+	l := zap.New()
 
 	tests := []struct {
 		name string
@@ -38,7 +38,7 @@ func TestStructure(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			// Setup
-			g := NewGomegaWithT(t)
+			g := NewWithT(t)
 			hc := &api.HierarchyConfiguration{Spec: api.HierarchyConfigurationSpec{Parent: tc.pnm}}
 			hc.ObjectMeta.Name = api.Singleton
 			hc.ObjectMeta.Namespace = tc.nnm
@@ -57,7 +57,7 @@ func TestStructure(t *testing.T) {
 func TestChangeParentOnManagedBy(t *testing.T) {
 	f := foresttest.Create("-a-c") // a <- b; c <- d
 	h := &Hierarchy{Forest: f}
-	l := zap.Logger(false)
+	l := zap.New()
 
 	// Make c and d external namespaces
 	f.Get("c").ExternalTreeLabels = map[string]int{"c" + api.LabelTreeDepthSuffix: 0}
@@ -82,7 +82,7 @@ func TestChangeParentOnManagedBy(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			// Setup
-			g := NewGomegaWithT(t)
+			g := NewWithT(t)
 			hc := &api.HierarchyConfiguration{Spec: api.HierarchyConfigurationSpec{Parent: tc.pnm}}
 			hc.ObjectMeta.Name = api.Singleton
 			hc.ObjectMeta.Namespace = tc.nnm
@@ -115,7 +115,7 @@ func TestChangeParentWithConflict(t *testing.T) {
 	createSecret("conflict", "d", f)
 
 	h := &Hierarchy{Forest: f}
-	l := zap.Logger(false)
+	l := zap.New()
 
 	tests := []struct {
 		name string
@@ -133,7 +133,7 @@ func TestChangeParentWithConflict(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			// Setup
-			g := NewGomegaWithT(t)
+			g := NewWithT(t)
 			hc := &api.HierarchyConfiguration{Spec: api.HierarchyConfigurationSpec{Parent: tc.pnm}}
 			hc.ObjectMeta.Name = api.Singleton
 			hc.ObjectMeta.Namespace = tc.nnm
@@ -177,10 +177,10 @@ func TestAuthz(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			// Setup
-			g := NewGomegaWithT(t)
+			g := NewWithT(t)
 			f := foresttest.Create(tc.forest)
 			h := &Hierarchy{Forest: f, server: tc.server}
-			l := zap.Logger(false)
+			l := zap.New()
 
 			// Create request
 			hc := &api.HierarchyConfiguration{Spec: api.HierarchyConfigurationSpec{Parent: tc.to}}

@@ -1,5 +1,5 @@
 /*
-Copyright 2019 The Kubernetes Authors.
+Copyright 2021 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/constants"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/conversion"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/metrics"
+	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/util"
 )
 
 var numMissMatchedPVCs uint64
@@ -40,14 +41,14 @@ func (c *controller) StartPatrol(stopCh <-chan struct{}) error {
 	if !cache.WaitForCacheSync(stopCh, c.pvcSynced) {
 		return fmt.Errorf("failed to wait for caches to sync before starting Service checker")
 	}
-	c.persistentVolumeClaimPatroller.Start(stopCh)
+	c.Patroller.Start(stopCh)
 	return nil
 }
 
 // PatrollerDo check if persistent volume claims keep consistency between super
 // master and tenant masters.
 func (c *controller) PatrollerDo() {
-	clusterNames := c.multiClusterPersistentVolumeClaimController.GetClusterNames()
+	clusterNames := c.MultiClusterController.GetClusterNames()
 	if len(clusterNames) == 0 {
 		klog.Infof("tenant masters has no clusters, give up period checker")
 		return
@@ -77,7 +78,7 @@ func (c *controller) PatrollerDo() {
 			continue
 		}
 		shouldDelete := false
-		vPVCObj, err := c.multiClusterPersistentVolumeClaimController.Get(clusterName, vNamespace, pPVC.Name)
+		vPVCObj, err := c.MultiClusterController.Get(clusterName, vNamespace, pPVC.Name)
 		if errors.IsNotFound(err) {
 			shouldDelete = true
 		}
@@ -102,7 +103,7 @@ func (c *controller) PatrollerDo() {
 }
 
 func (c *controller) checkPVCOfTenantCluster(clusterName string) {
-	listObj, err := c.multiClusterPersistentVolumeClaimController.List(clusterName)
+	listObj, err := c.MultiClusterController.List(clusterName)
 	if err != nil {
 		klog.Errorf("error listing PVCs from cluster %s informer cache: %v", clusterName, err)
 		return
@@ -113,7 +114,7 @@ func (c *controller) checkPVCOfTenantCluster(clusterName string) {
 		targetNamespace := conversion.ToSuperMasterNamespace(clusterName, vPVC.Namespace)
 		pPVC, err := c.pvcLister.PersistentVolumeClaims(targetNamespace).Get(vPVC.Name)
 		if errors.IsNotFound(err) {
-			if err := c.multiClusterPersistentVolumeClaimController.RequeueObject(clusterName, &pvcList.Items[i]); err != nil {
+			if err := c.MultiClusterController.RequeueObject(clusterName, &pvcList.Items[i]); err != nil {
 				klog.Errorf("error requeue vPVC %v/%v in cluster %s: %v", vPVC.Namespace, vPVC.Name, clusterName, err)
 			} else {
 				metrics.CheckerRemedyStats.WithLabelValues("RequeuedTenantPVCs").Inc()
@@ -131,12 +132,12 @@ func (c *controller) checkPVCOfTenantCluster(clusterName string) {
 			continue
 		}
 
-		spec, err := c.multiClusterPersistentVolumeClaimController.GetSpec(clusterName)
+		vc, err := util.GetVirtualClusterObject(c.MultiClusterController, clusterName)
 		if err != nil {
 			klog.Errorf("fail to get cluster spec : %s", clusterName)
 			continue
 		}
-		updatedPVC := conversion.Equality(c.config, spec).CheckPVCEquality(pPVC, &vPVC)
+		updatedPVC := conversion.Equality(c.Config, vc).CheckPVCEquality(pPVC, &vPVC)
 		if updatedPVC != nil {
 			atomic.AddUint64(&numMissMatchedPVCs, 1)
 			klog.Warningf("spec of pvc %v/%v diff in super&tenant master", vPVC.Namespace, vPVC.Name)

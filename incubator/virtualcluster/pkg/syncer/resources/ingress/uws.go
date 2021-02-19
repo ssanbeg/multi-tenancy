@@ -1,5 +1,5 @@
 /*
-Copyright 2020 The Kubernetes Authors.
+Copyright 2021 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -31,6 +31,7 @@ import (
 
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/constants"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/conversion"
+	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/util"
 )
 
 // StartUWS starts the upward syncer
@@ -39,7 +40,7 @@ func (c *controller) StartUWS(stopCh <-chan struct{}) error {
 	if !cache.WaitForCacheSync(stopCh, c.ingressSynced) {
 		return fmt.Errorf("failed to wait for caches to sync")
 	}
-	return c.upwardIngressController.Start(stopCh)
+	return c.UpwardController.Start(stopCh)
 }
 
 func (c *controller) BackPopulate(key string) error {
@@ -63,7 +64,7 @@ func (c *controller) BackPopulate(key string) error {
 		return nil
 	}
 
-	vIngressObj, err := c.multiClusterIngressController.Get(clusterName, vNamespace, pName)
+	vIngressObj, err := c.MultiClusterController.Get(clusterName, vNamespace, pName)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			return nil
@@ -75,18 +76,18 @@ func (c *controller) BackPopulate(key string) error {
 		return fmt.Errorf("BackPopulated pIngress %s/%s delegated UID is different from updated object.", pIngress.Namespace, pIngress.Name)
 	}
 
-	tenantClient, err := c.multiClusterIngressController.GetClusterClient(clusterName)
+	tenantClient, err := c.MultiClusterController.GetClusterClient(clusterName)
 	if err != nil {
 		return pkgerr.Wrapf(err, "failed to create client from cluster %s config", clusterName)
 	}
 
-	spec, err := c.multiClusterIngressController.GetSpec(clusterName)
+	vc, err := util.GetVirtualClusterObject(c.MultiClusterController, clusterName)
 	if err != nil {
 		return pkgerr.Wrapf(err, "failed to get spec of cluster %s", clusterName)
 	}
 
 	var newIngress *v1beta1.Ingress
-	updatedMeta := conversion.Equality(c.config, spec).CheckUWObjectMetaEquality(&pIngress.ObjectMeta, &vIngress.ObjectMeta)
+	updatedMeta := conversion.Equality(c.Config, vc).CheckUWObjectMetaEquality(&pIngress.ObjectMeta, &vIngress.ObjectMeta)
 	if updatedMeta != nil {
 		newIngress = vIngress.DeepCopy()
 		newIngress.ObjectMeta = *updatedMeta

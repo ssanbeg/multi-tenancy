@@ -17,28 +17,34 @@ limitations under the License.
 package namespace
 
 import (
-	"fmt"
-
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/informers"
 	clientset "k8s.io/client-go/kubernetes"
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
 	listersv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/klog"
 
 	vcclient "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/client/clientset/versioned"
 	vcinformers "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/client/informers/externalversions/tenancy/v1alpha1"
 	vclisters "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/client/listers/tenancy/v1alpha1"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/apis/config"
-	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/constants"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/manager"
-	mc "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/mccontroller"
 	pa "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/patrol"
-	uw "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/uwcontroller"
+	mc "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/mccontroller"
+	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/plugin"
 )
 
+func init() {
+	plugin.SyncerResourceRegister.Register(&plugin.Registration{
+		ID: "namespace",
+		InitFn: func(ctx *plugin.InitContext) (interface{}, error) {
+			return NewNamespaceController(ctx.Config.(*config.SyncerConfiguration), ctx.Client, ctx.Informer, ctx.VCClient, ctx.VCInformer, manager.ResourceSyncerOptions{})
+		},
+	})
+}
+
 type controller struct {
+	manager.BaseResourceSyncer
 	// super master namespace client
 	namespaceClient v1core.NamespacesGetter
 	// super master namespace lister
@@ -48,10 +54,6 @@ type controller struct {
 	vcClient vcclient.Interface
 	vcLister vclisters.VirtualClusterLister
 	vcSynced cache.InformerSynced
-	// Connect to all tenant master namespace informers
-	multiClusterNamespaceController *mc.MultiClusterController
-	// Periodic checker
-	namespacePatroller *pa.Patroller
 }
 
 func NewNamespaceController(config *config.SyncerConfiguration,
@@ -59,26 +61,24 @@ func NewNamespaceController(config *config.SyncerConfiguration,
 	informer informers.SharedInformerFactory,
 	vcClient vcclient.Interface,
 	vcInformer vcinformers.VirtualClusterInformer,
-	options *manager.ResourceSyncerOptions) (manager.ResourceSyncer, *mc.MultiClusterController, *uw.UpwardController, error) {
+	options manager.ResourceSyncerOptions) (manager.ResourceSyncer, error) {
 	c := &controller{
+		BaseResourceSyncer: manager.BaseResourceSyncer{
+			Config: config,
+		},
 		namespaceClient: client.CoreV1(),
 		vcClient:        vcClient,
 	}
-	var mcOptions *mc.Options
-	if options == nil || options.MCOptions == nil {
-		mcOptions = &mc.Options{Reconciler: c}
-	} else {
-		mcOptions = options.MCOptions
-	}
-	mcOptions.MaxConcurrentReconciles = constants.DwsControllerWorkerLow
-	multiClusterNamespaceController, err := mc.NewMCController("tenant-masters-namespace-controller", &v1.Namespace{}, *mcOptions)
+
+	var err error
+	c.MultiClusterController, err = mc.NewMCController(&v1.Namespace{}, &v1.NamespaceList{}, c, mc.WithOptions(options.MCOptions))
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to create namespace mc controller: %v", err)
+		return nil, err
 	}
-	c.multiClusterNamespaceController = multiClusterNamespaceController
+
 	c.nsLister = informer.Core().V1().Namespaces().Lister()
 	c.vcLister = vcInformer.Lister()
-	if options != nil && options.IsFake {
+	if options.IsFake {
 		c.nsSynced = func() bool { return true }
 		c.vcSynced = func() bool { return true }
 	} else {
@@ -86,38 +86,10 @@ func NewNamespaceController(config *config.SyncerConfiguration,
 		c.vcSynced = vcInformer.Informer().HasSynced
 	}
 
-	var patrolOptions *pa.Options
-	if options == nil || options.PatrolOptions == nil {
-		patrolOptions = &pa.Options{Reconciler: c}
-	} else {
-		patrolOptions = options.PatrolOptions
-	}
-	namespacePatroller, err := pa.NewPatroller("namespace-patroller", &v1.Namespace{}, *patrolOptions)
+	c.Patroller, err = pa.NewPatroller(&v1.Namespace{}, c, pa.WithOptions(options.PatrolOptions))
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to create namespace patroller: %v", err)
+		return nil, err
 	}
-	c.namespacePatroller = namespacePatroller
 
-	return c, multiClusterNamespaceController, nil, nil
-}
-
-func (c *controller) StartUWS(stopCh <-chan struct{}) error {
-	return nil
-}
-
-func (c *controller) BackPopulate(string) error {
-	return nil
-}
-
-func (c *controller) AddCluster(cluster mc.ClusterInterface) {
-	klog.Infof("tenant-masters-namespace-controller watch cluster %s for namespace resource", cluster.GetClusterName())
-	err := c.multiClusterNamespaceController.WatchClusterResource(cluster, mc.WatchOptions{})
-	if err != nil {
-		klog.Errorf("failed to watch cluster %s namespace event: %v", cluster.GetClusterName(), err)
-	}
-}
-
-func (c *controller) RemoveCluster(cluster mc.ClusterInterface) {
-	klog.Infof("tenant-masters-namespace-controller stop watching cluster %s for namespace resource", cluster.GetClusterName())
-	c.multiClusterNamespaceController.TeardownClusterResource(cluster)
+	return c, nil
 }

@@ -25,11 +25,11 @@ import (
 	vcclient "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/client/clientset/versioned"
 	vcinformers "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/client/informers/externalversions/tenancy/v1alpha1"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/apis/config"
-	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/listener"
-	mc "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/mccontroller"
 	pa "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/patrol"
-	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/reconciler"
 	uw "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/uwcontroller"
+	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/listener"
+	mc "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/mccontroller"
+	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/reconciler"
 )
 
 // ControllerManager manages number of resource syncers. It starts their caches, waits for those to sync,
@@ -51,10 +51,12 @@ func New() *ControllerManager {
 
 // ResourceSyncer is the interface used by ControllerManager to manage multiple resource syncers.
 type ResourceSyncer interface {
-	listener.ClusterChangeListener
 	reconciler.DWReconciler
 	reconciler.UWReconciler
 	reconciler.PatrolReconciler
+	GetMCController() *mc.MultiClusterController
+	GetUpwardController() *uw.UpwardController
+	GetListener() listener.ClusterChangeListener
 	StartUWS(stopCh <-chan struct{}) error
 	StartDWS(stopCh <-chan struct{}) error
 	StartPatrol(stopCh <-chan struct{}) error
@@ -63,14 +65,65 @@ type ResourceSyncer interface {
 // AddController adds a resource syncer to the ControllerManager.
 func (m *ControllerManager) AddResourceSyncer(s ResourceSyncer) {
 	m.resourceSyncers[s] = struct{}{}
-	listener.AddListener(s)
+
+	l := s.GetListener()
+	if l == nil {
+		panic("resource Syncer should provide listener")
+	}
+
+	listener.AddListener(l)
 }
 
 type ResourceSyncerNew func(*config.SyncerConfiguration,
 	clientset.Interface,
 	informers.SharedInformerFactory,
 	vcclient.Interface,
-	vcinformers.VirtualClusterInformer, *ResourceSyncerOptions) (ResourceSyncer, *mc.MultiClusterController, *uw.UpwardController, error)
+	vcinformers.VirtualClusterInformer, ResourceSyncerOptions) (ResourceSyncer, error)
+
+type BaseResourceSyncer struct {
+	Config                 *config.SyncerConfiguration
+	MultiClusterController *mc.MultiClusterController
+	UpwardController       *uw.UpwardController
+	Patroller              *pa.Patroller
+}
+
+var _ ResourceSyncer = &BaseResourceSyncer{}
+
+func (b *BaseResourceSyncer) Reconcile(request reconciler.Request) (reconciler.Result, error) {
+	return reconciler.Result{}, nil
+}
+
+func (b *BaseResourceSyncer) BackPopulate(s string) error {
+	return nil
+}
+
+func (b *BaseResourceSyncer) PatrollerDo() {
+	return
+}
+
+func (b *BaseResourceSyncer) GetListener() listener.ClusterChangeListener {
+	return listener.NewMCControllerListener(b.MultiClusterController)
+}
+
+func (b *BaseResourceSyncer) GetMCController() *mc.MultiClusterController {
+	return b.MultiClusterController
+}
+
+func (b *BaseResourceSyncer) GetUpwardController() *uw.UpwardController {
+	return b.UpwardController
+}
+
+func (b *BaseResourceSyncer) StartUWS(stopCh <-chan struct{}) error {
+	return nil
+}
+
+func (b *BaseResourceSyncer) StartDWS(stopCh <-chan struct{}) error {
+	return nil
+}
+
+func (b *BaseResourceSyncer) StartPatrol(stopCh <-chan struct{}) error {
+	return nil
+}
 
 // Start gets all the unique caches of the controllers it manages, starts them,
 // then starts the controllers as soon as their respective caches are synced.

@@ -17,37 +17,38 @@ limitations under the License.
 package endpoints
 
 import (
-	"fmt"
-
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/informers"
 	clientset "k8s.io/client-go/kubernetes"
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
 	listersv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/klog"
 
 	vcclient "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/client/clientset/versioned"
 	vcinformers "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/client/informers/externalversions/tenancy/v1alpha1"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/apis/config"
-	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/constants"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/manager"
-	mc "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/mccontroller"
 	pa "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/patrol"
-	uw "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/uwcontroller"
+	mc "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/mccontroller"
+	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/plugin"
 )
 
+func init() {
+	plugin.SyncerResourceRegister.Register(&plugin.Registration{
+		ID: "endpoints",
+		InitFn: func(ctx *plugin.InitContext) (interface{}, error) {
+			return NewEndpointsController(ctx.Config.(*config.SyncerConfiguration), ctx.Client, ctx.Informer, ctx.VCClient, ctx.VCInformer, manager.ResourceSyncerOptions{})
+		},
+	})
+}
+
 type controller struct {
-	config *config.SyncerConfiguration
+	manager.BaseResourceSyncer
 	// super master endpoints client
 	endpointClient v1core.EndpointsGetter
 	// super master endpoints informer lister/synced function
 	endpointsLister listersv1.EndpointsLister
 	endpointsSynced cache.InformerSynced
-	// Connect to all tenant master endpoints informers
-	multiClusterEndpointsController *mc.MultiClusterController
-	// Periodic checker
-	endPointsPatroller *pa.Patroller
 }
 
 func NewEndpointsController(config *config.SyncerConfiguration,
@@ -55,63 +56,31 @@ func NewEndpointsController(config *config.SyncerConfiguration,
 	informer informers.SharedInformerFactory,
 	vcClient vcclient.Interface,
 	vcInformer vcinformers.VirtualClusterInformer,
-	options *manager.ResourceSyncerOptions) (manager.ResourceSyncer, *mc.MultiClusterController, *uw.UpwardController, error) {
+	options manager.ResourceSyncerOptions) (manager.ResourceSyncer, error) {
 	c := &controller{
-		config:         config,
+		BaseResourceSyncer: manager.BaseResourceSyncer{
+			Config: config,
+		},
 		endpointClient: client.CoreV1(),
 	}
 
-	var mcOptions *mc.Options
-	if options == nil || options.MCOptions == nil {
-		mcOptions = &mc.Options{Reconciler: c}
-	} else {
-		mcOptions = options.MCOptions
-	}
-	mcOptions.MaxConcurrentReconciles = constants.DwsControllerWorkerLow
-	multiClusterEndpointsController, err := mc.NewMCController("tenant-masters-endpoints-controller", &v1.Endpoints{}, *mcOptions)
+	var err error
+	c.MultiClusterController, err = mc.NewMCController(&v1.Endpoints{}, &v1.EndpointsList{}, c, mc.WithOptions(options.MCOptions))
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to create endpoints mc controller: %v", err)
+		return nil, err
 	}
-	c.multiClusterEndpointsController = multiClusterEndpointsController
+
 	c.endpointsLister = informer.Core().V1().Endpoints().Lister()
-	if options != nil && options.IsFake {
+	if options.IsFake {
 		c.endpointsSynced = func() bool { return true }
 	} else {
 		c.endpointsSynced = informer.Core().V1().Endpoints().Informer().HasSynced
 	}
 
-	var patrolOptions *pa.Options
-	if options == nil || options.PatrolOptions == nil {
-		patrolOptions = &pa.Options{Reconciler: c}
-	} else {
-		patrolOptions = options.PatrolOptions
-	}
-	endPointsPatroller, err := pa.NewPatroller("endPoints-patroller", &v1.Endpoints{}, *patrolOptions)
+	c.Patroller, err = pa.NewPatroller(&v1.Endpoints{}, c, pa.WithOptions(options.PatrolOptions))
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to create endpoints patroller: %v", err)
+		return nil, err
 	}
-	c.endPointsPatroller = endPointsPatroller
 
-	return c, multiClusterEndpointsController, nil, nil
-}
-
-func (c *controller) StartUWS(stopCh <-chan struct{}) error {
-	return nil
-}
-
-func (c *controller) BackPopulate(string) error {
-	return nil
-}
-
-func (c *controller) AddCluster(cluster mc.ClusterInterface) {
-	klog.Infof("tenant-masters-endpoints-controller watch cluster %s for endpoints resource", cluster.GetClusterName())
-	err := c.multiClusterEndpointsController.WatchClusterResource(cluster, mc.WatchOptions{})
-	if err != nil {
-		klog.Errorf("failed to watch cluster %s endpoints event: %v", cluster.GetClusterName(), err)
-	}
-}
-
-func (c *controller) RemoveCluster(cluster mc.ClusterInterface) {
-	klog.Infof("tenant-masters-endpoints-controller stop watching cluster %s for endpoints resource", cluster.GetClusterName())
-	c.multiClusterEndpointsController.TeardownClusterResource(cluster)
+	return c, nil
 }

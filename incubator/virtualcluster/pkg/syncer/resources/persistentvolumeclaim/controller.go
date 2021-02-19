@@ -17,37 +17,38 @@ limitations under the License.
 package persistentvolumeclaim
 
 import (
-	"fmt"
-
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/informers"
 	clientset "k8s.io/client-go/kubernetes"
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
 	listersv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/klog"
 
 	vcclient "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/client/clientset/versioned"
 	vcinformers "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/client/informers/externalversions/tenancy/v1alpha1"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/apis/config"
-	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/constants"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/manager"
-	mc "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/mccontroller"
 	pa "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/patrol"
-	uw "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/uwcontroller"
+	mc "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/mccontroller"
+	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/plugin"
 )
 
+func init() {
+	plugin.SyncerResourceRegister.Register(&plugin.Registration{
+		ID: "persistentvolumeclaim",
+		InitFn: func(ctx *plugin.InitContext) (interface{}, error) {
+			return NewPVCController(ctx.Config.(*config.SyncerConfiguration), ctx.Client, ctx.Informer, ctx.VCClient, ctx.VCInformer, manager.ResourceSyncerOptions{})
+		},
+	})
+}
+
 type controller struct {
-	config *config.SyncerConfiguration
+	manager.BaseResourceSyncer
 	// super master pvc client
 	pvcClient v1core.PersistentVolumeClaimsGetter
 	// super master pvc lister
 	pvcLister listersv1.PersistentVolumeClaimLister
 	pvcSynced cache.InformerSynced
-	// Connect to all tenant master pvc informers
-	multiClusterPersistentVolumeClaimController *mc.MultiClusterController
-	// Periodic checker
-	persistentVolumeClaimPatroller *pa.Patroller
 }
 
 func NewPVCController(config *config.SyncerConfiguration,
@@ -55,63 +56,31 @@ func NewPVCController(config *config.SyncerConfiguration,
 	informer informers.SharedInformerFactory,
 	vcClient vcclient.Interface,
 	vcInformer vcinformers.VirtualClusterInformer,
-	options *manager.ResourceSyncerOptions) (manager.ResourceSyncer, *mc.MultiClusterController, *uw.UpwardController, error) {
+	options manager.ResourceSyncerOptions) (manager.ResourceSyncer, error) {
 	c := &controller{
-		config:    config,
+		BaseResourceSyncer: manager.BaseResourceSyncer{
+			Config: config,
+		},
 		pvcClient: client.CoreV1(),
 	}
 
-	var mcOptions *mc.Options
-	if options == nil || options.MCOptions == nil {
-		mcOptions = &mc.Options{Reconciler: c}
-	} else {
-		mcOptions = options.MCOptions
-	}
-	mcOptions.MaxConcurrentReconciles = constants.DwsControllerWorkerLow
-	multiClusterPersistentVolumeClaimController, err := mc.NewMCController("tenant-masters-pvc-controller", &v1.PersistentVolumeClaim{}, *mcOptions)
+	var err error
+	c.MultiClusterController, err = mc.NewMCController(&v1.PersistentVolumeClaim{}, &v1.PersistentVolumeClaimList{}, c, mc.WithOptions(options.MCOptions))
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to create persistentVolumeClaim mc controller: %v", err)
+		return nil, err
 	}
-	c.multiClusterPersistentVolumeClaimController = multiClusterPersistentVolumeClaimController
+
 	c.pvcLister = informer.Core().V1().PersistentVolumeClaims().Lister()
-	if options != nil && options.IsFake {
+	if options.IsFake {
 		c.pvcSynced = func() bool { return true }
 	} else {
 		c.pvcSynced = informer.Core().V1().PersistentVolumeClaims().Informer().HasSynced
 	}
 
-	var patrolOptions *pa.Options
-	if options == nil || options.PatrolOptions == nil {
-		patrolOptions = &pa.Options{Reconciler: c}
-	} else {
-		patrolOptions = options.PatrolOptions
-	}
-	persistentVolumeClaimPatroller, err := pa.NewPatroller("pvc-patroller", &v1.PersistentVolumeClaim{}, *patrolOptions)
+	c.Patroller, err = pa.NewPatroller(&v1.PersistentVolumeClaim{}, c, pa.WithOptions(options.PatrolOptions))
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to create persistentVolumeClaim patroller: %v", err)
+		return nil, err
 	}
-	c.persistentVolumeClaimPatroller = persistentVolumeClaimPatroller
 
-	return c, multiClusterPersistentVolumeClaimController, nil, nil
-}
-
-func (c *controller) StartUWS(stopCh <-chan struct{}) error {
-	return nil
-}
-
-func (c *controller) BackPopulate(string) error {
-	return nil
-}
-
-func (c *controller) AddCluster(cluster mc.ClusterInterface) {
-	klog.Infof("tenant-masters-pvc-controller watch cluster %s for pvc resource", cluster.GetClusterName())
-	err := c.multiClusterPersistentVolumeClaimController.WatchClusterResource(cluster, mc.WatchOptions{})
-	if err != nil {
-		klog.Errorf("failed to watch cluster %s pvc event: %v", cluster.GetClusterName(), err)
-	}
-}
-
-func (c *controller) RemoveCluster(cluster mc.ClusterInterface) {
-	klog.Infof("tenant-masters-pvc-controller stop watching cluster %s for pvc resource", cluster.GetClusterName())
-	c.multiClusterPersistentVolumeClaimController.TeardownClusterResource(cluster)
+	return c, nil
 }

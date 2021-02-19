@@ -28,9 +28,9 @@ import (
 
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/apis/tenancy/v1alpha1"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/apis/config"
-	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/cluster"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/manager"
 	uw "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/uwcontroller"
+	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/cluster"
 )
 
 type fakeUWReconciler struct {
@@ -45,7 +45,12 @@ func (r *fakeUWReconciler) BackPopulate(key string) error {
 	} else {
 		err = fmt.Errorf("fake reconciler's upward controller is not initialized")
 	}
-	r.errCh <- err
+	select {
+	case <-r.errCh:
+	default:
+		// if channel not closed
+		r.errCh <- err
+	}
 	// Make sure the BackPopulate is called once by returning no error
 	return nil
 }
@@ -62,6 +67,7 @@ func RunUpwardSync(
 	enqueueKey string,
 	controllerStateModifyFunc controllerStateModifier,
 ) (actions []core.Action, reconcileError error, err error) {
+	registerDefaultScheme()
 	// setup fake tenant cluster
 	tenantClientset := fake.NewSimpleClientset()
 	tenantClient := fakeClient.NewFakeClient()
@@ -87,12 +93,12 @@ func RunUpwardSync(
 	syncErr := make(chan error)
 	defer close(syncErr)
 	fakeRc := &fakeUWReconciler{errCh: syncErr}
-	rsOptions := &manager.ResourceSyncerOptions{
+	rsOptions := manager.ResourceSyncerOptions{
 		UWOptions: &uw.Options{Reconciler: fakeRc},
 		IsFake:    true,
 	}
 
-	resourceSyncer, _, upwardController, err := newControllerFunc(
+	resourceSyncer, err := newControllerFunc(
 		&config.SyncerConfiguration{
 			DisableServiceAccountToken: true,
 		},
@@ -113,8 +119,9 @@ func RunUpwardSync(
 	}
 
 	// register tenant cluster to controller.
-	resourceSyncer.AddCluster(tenantCluster)
-	defer resourceSyncer.RemoveCluster(tenantCluster)
+	resourceSyncer.GetListener().AddCluster(tenantCluster)
+	resourceSyncer.GetListener().WatchCluster(tenantCluster)
+	defer resourceSyncer.GetListener().RemoveCluster(tenantCluster)
 
 	stopCh := make(chan struct{})
 	defer close(stopCh)
@@ -122,12 +129,12 @@ func RunUpwardSync(
 
 	// add object to super informer.
 	for _, each := range existingObjectInSuper {
-		informer := getObjectInformer(superInformer, each)
+		informer := superInformer.InformerFor(each, nil)
 		informer.GetStore().Add(each)
 	}
 
 	// start testing
-	upwardController.AddToQueue(enqueueKey)
+	resourceSyncer.GetUpwardController().AddToQueue(enqueueKey)
 
 	// wait to be called
 	select {

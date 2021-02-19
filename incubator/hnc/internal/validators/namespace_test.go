@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	. "github.com/onsi/gomega"
-	"k8s.io/api/admission/v1beta1"
+	k8sadm "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 
 	api "sigs.k8s.io/multi-tenancy/incubator/hnc/api/v1alpha2"
@@ -35,7 +35,7 @@ func TestDeleteSubNamespace(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			g := NewGomegaWithT(t)
+			g := NewWithT(t)
 
 			// Create a namespace instance a and add the subnamespace-of annotation.
 			sub := &corev1.Namespace{}
@@ -44,7 +44,7 @@ func TestDeleteSubNamespace(t *testing.T) {
 
 			req := &nsRequest{
 				ns: sub,
-				op: v1beta1.Delete,
+				op: k8sadm.Delete,
 			}
 
 			// Construct the forest
@@ -76,10 +76,10 @@ func TestDeleteOwnerNamespace(t *testing.T) {
 	c := f.Get("c")
 
 	t.Run("Delete a namespace with subnamespaces", func(t *testing.T) {
-		g := NewGomegaWithT(t)
+		g := NewWithT(t)
 		req := &nsRequest{
 			ns: aInst,
-			op: v1beta1.Delete,
+			op: k8sadm.Delete,
 		}
 
 		// Test
@@ -133,10 +133,10 @@ func TestCreateNamespace(t *testing.T) {
 	ns.Name = nm
 
 	t.Run("Create namespace with an already existing name in external hierarchy", func(t *testing.T) {
-		g := NewGomegaWithT(t)
+		g := NewWithT(t)
 		req := &nsRequest{
 			ns: ns,
-			op: v1beta1.Create,
+			op: k8sadm.Create,
 		}
 
 		// Test
@@ -188,7 +188,7 @@ func TestUpdateNamespaceManagedBy(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			g := NewGomegaWithT(t)
+			g := NewWithT(t)
 			tnsInst := tc.nsInst
 			if tc.managedBy == "" {
 				tnsInst.SetAnnotations(map[string]string{})
@@ -198,7 +198,7 @@ func TestUpdateNamespaceManagedBy(t *testing.T) {
 
 			req := &nsRequest{
 				ns: tc.nsInst,
-				op: v1beta1.Update,
+				op: k8sadm.Update,
 			}
 
 			// Test

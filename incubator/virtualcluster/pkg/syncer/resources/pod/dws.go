@@ -1,5 +1,5 @@
 /*
-Copyright 2019 The Kubernetes Authors.
+Copyright 2021 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -33,14 +33,17 @@ import (
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/constants"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/conversion"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/metrics"
-	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/reconciler"
+	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/util"
+	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/util/featuregate"
+	utilconstants "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/constants"
+	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/reconciler"
 )
 
 func (c *controller) StartDWS(stopCh <-chan struct{}) error {
 	if !cache.WaitForCacheSync(stopCh, c.podSynced, c.serviceSynced, c.secretSynced) {
 		return fmt.Errorf("failed to wait for caches to sync before starting Pod dws")
 	}
-	return c.multiClusterPodController.Start(stopCh)
+	return c.MultiClusterController.Start(stopCh)
 }
 
 func (c *controller) Reconcile(request reconciler.Request) (res reconciler.Result, retErr error) {
@@ -53,7 +56,7 @@ func (c *controller) Reconcile(request reconciler.Request) (res reconciler.Resul
 	}
 
 	var vPod *v1.Pod
-	vPodObj, err := c.multiClusterPodController.Get(request.ClusterName, request.Namespace, request.Name)
+	vPodObj, err := c.MultiClusterController.Get(request.ClusterName, request.Namespace, request.Name)
 	if err == nil {
 		vPod = vPodObj.(*v1.Pod)
 	} else if !errors.IsNotFound(err) {
@@ -73,9 +76,9 @@ func (c *controller) Reconcile(request reconciler.Request) (res reconciler.Resul
 			klog.Errorf("failed reconcile Pod %s/%s CREATE of cluster %s %v", request.Namespace, request.Name, request.ClusterName, err)
 
 			if parentRef := getParentRefFromPod(vPod); parentRef != nil {
-				c.multiClusterPodController.Eventf(request.ClusterName, parentRef, v1.EventTypeWarning, "FailedCreate", "Error creating: %v", err)
+				c.MultiClusterController.Eventf(request.ClusterName, parentRef, v1.EventTypeWarning, "FailedCreate", "Error creating: %v", err)
 			}
-			c.multiClusterPodController.Eventf(request.ClusterName, &v1.ObjectReference{
+			c.MultiClusterController.Eventf(request.ClusterName, &v1.ObjectReference{
 				Kind:      "Pod",
 				Namespace: vPod.Namespace,
 				UID:       vPod.UID,
@@ -159,7 +162,7 @@ func (c *controller) reconcilePodCreate(clusterName, targetNamespace, requestUID
 
 	if vPod.Spec.NodeName != "" {
 		// For now, we skip vPod that has NodeName set to prevent tenant from deploying DaemonSet or DaemonSet alike CRDs.
-		err := c.multiClusterPodController.Eventf(clusterName, &v1.ObjectReference{
+		err := c.MultiClusterController.Eventf(clusterName, &v1.ObjectReference{
 			Kind:      "Pod",
 			Namespace: vPod.Namespace,
 			UID:       vPod.UID,
@@ -167,11 +170,11 @@ func (c *controller) reconcilePodCreate(clusterName, targetNamespace, requestUID
 		return err
 	}
 
-	vcName, _, _, err := c.multiClusterPodController.GetOwnerInfo(clusterName)
+	vcName, vcNS, _, err := c.MultiClusterController.GetOwnerInfo(clusterName)
 	if err != nil {
 		return err
 	}
-	newObj, err := conversion.BuildMetadata(clusterName, vcName, targetNamespace, vPod)
+	newObj, err := conversion.BuildMetadata(clusterName, vcNS, vcName, targetNamespace, vPod)
 	if err != nil {
 		return err
 	}
@@ -195,12 +198,12 @@ func (c *controller) reconcilePodCreate(clusterName, targetNamespace, requestUID
 
 	var ms = []conversion.PodMutator{
 		conversion.PodMutateDefault(vPod, pSecretMap, services, nameServer),
-		conversion.PodMutateAutoMountServiceAccountToken(c.config.DisableServiceAccountToken),
+		conversion.PodMutateAutoMountServiceAccountToken(c.Config.DisableServiceAccountToken),
 		// TODO: make extension configurable
 		//conversion.PodAddExtensionMeta(vPod),
 	}
 
-	err = conversion.VC(c.multiClusterPodController, clusterName).Pod(pPod).Mutate(ms...)
+	err = conversion.VC(c.MultiClusterController, clusterName).Pod(pPod).Mutate(ms...)
 	if err != nil {
 		return fmt.Errorf("failed to mutate pod: %v", err)
 	}
@@ -229,7 +232,7 @@ func (c *controller) findPodServiceAccountSecret(clusterName string, pPod, vPod 
 	mutateNameMap := make(map[string]string)
 
 	for secretName := range mountSecretSet {
-		vSecretObj, err := c.multiClusterPodController.GetByObjectType(clusterName, vPod.Namespace, secretName, &v1.Secret{})
+		vSecretObj, err := c.MultiClusterController.GetByObjectType(clusterName, vPod.Namespace, secretName, &v1.Secret{})
 		if err != nil {
 			return nil, pkgerr.Wrapf(err, "failed to get vSecret %s/%s", vPod.Namespace, secretName)
 		}
@@ -266,6 +269,14 @@ func (c *controller) getClusterNameServer(cluster string) (string, error) {
 
 func (c *controller) getPodRelatedServices(cluster string, pPod *v1.Pod) ([]*v1.Service, error) {
 	var services []*v1.Service
+	if featuregate.DefaultFeatureGate.Enabled(featuregate.SuperClusterServiceNetwork) {
+		apiserver, err := c.serviceLister.Services(cluster).Get("apiserver-svc")
+		if err != nil {
+			return nil, err
+		}
+		services = append(services, apiserver)
+	}
+
 	list, err := c.serviceLister.Services(conversion.ToSuperMasterNamespace(cluster, metav1.NamespaceDefault)).List(labels.Everything())
 	if err != nil {
 		return nil, err
@@ -301,11 +312,11 @@ func (c *controller) reconcilePodUpdate(clusterName, targetNamespace, requestUID
 		}
 		return err
 	}
-	spec, err := c.multiClusterPodController.GetSpec(clusterName)
+	vc, err := util.GetVirtualClusterObject(c.MultiClusterController, clusterName)
 	if err != nil {
 		return err
 	}
-	updatedPod := conversion.Equality(c.config, spec).CheckPodEquality(pPod, vPod)
+	updatedPod := conversion.Equality(c.Config, vc).CheckPodEquality(pPod, vPod)
 	if updatedPod != nil {
 		pPod, err = c.client.Pods(targetNamespace).Update(context.TODO(), updatedPod, metav1.UpdateOptions{})
 		if err != nil {
@@ -347,8 +358,8 @@ func recordOperationDuration(operation string, start time.Time) {
 
 func recordOperationStatus(operation string, err error) {
 	if err != nil {
-		metrics.PodOperations.With(prometheus.Labels{"operation_type": operation, "code": constants.StatusCodeError}).Inc()
+		metrics.PodOperations.With(prometheus.Labels{"operation_type": operation, "code": utilconstants.StatusCodeError}).Inc()
 		return
 	}
-	metrics.PodOperations.With(prometheus.Labels{"operation_type": operation, "code": constants.StatusCodeOK}).Inc()
+	metrics.PodOperations.With(prometheus.Labels{"operation_type": operation, "code": utilconstants.StatusCodeOK}).Inc()
 }

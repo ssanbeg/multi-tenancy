@@ -3,11 +3,9 @@ package blockuseofnodeportservices
 import (
 	"context"
 	"fmt"
-	deploymentutil "sigs.k8s.io/multi-tenancy/benchmarks/kubectl-mtb/test/utils/resources/deployment"
+	v1 "k8s.io/api/core/v1"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/uuid"
-	imageutils "k8s.io/kubernetes/test/utils/image"
 	"sigs.k8s.io/multi-tenancy/benchmarks/kubectl-mtb/bundle/box"
 	"sigs.k8s.io/multi-tenancy/benchmarks/kubectl-mtb/pkg/benchmark"
 	"sigs.k8s.io/multi-tenancy/benchmarks/kubectl-mtb/test"
@@ -27,16 +25,10 @@ var b = &benchmark.Benchmark{
 					Name: "services",
 				},
 			},
-			{
-				APIGroup: "apps",
-				APIResource: metav1.APIResource{
-					Name: "deployments",
-				},
-			},
 		}
 
 		for _, resource := range resources {
-			access, msg, err := utils.RunAccessCheck(options.TClient, options.TenantNamespace, resource, "create")
+			access, msg, err := utils.RunAccessCheck(options.Tenant1Client, options.TenantNamespace, resource, "create")
 			if err != nil {
 				options.Logger.Debug(err.Error())
 				return err
@@ -52,25 +44,10 @@ var b = &benchmark.Benchmark{
 	Run: func(options types.RunOptions) error {
 
 		podLabels := map[string]string{"test": "multi"}
-		deploymentName := "deployment-" + string(uuid.NewUUID())
-		imageName := "image-" + string(uuid.NewUUID())
-		deploymentSpec := &deploymentutil.DeploymentSpec{DeploymentName: deploymentName, Replicas: 1, PodLabels: podLabels, ImageName: imageName, Image: imageutils.GetE2EImage(imageutils.Nginx), StrategyType: "Recreate"}
-		err := deploymentSpec.SetDefaults()
-		if err != nil {
-			options.Logger.Debug(err.Error())
-			return err
-		}
 
-		deployment := deploymentSpec.GetDeployment()
-		_, err = options.TClient.AppsV1().Deployments(options.TenantNamespace).Create(context.TODO(), deployment, metav1.CreateOptions{DryRun: []string{metav1.DryRunAll}})
-		if err != nil {
-			options.Logger.Debug(err.Error())
-			return err
-		}
-
-		svcSpec := &serviceutil.ServiceConfig{Type: "NodePort", Selector: podLabels}
+		svcSpec := &serviceutil.ServiceConfig{Type: v1.ServiceTypeNodePort, Selector: podLabels}
 		svc := svcSpec.CreateServiceSpec()
-		_, err = options.TClient.CoreV1().Services(options.TenantNamespace).Create(context.TODO(), svc, metav1.CreateOptions{DryRun: []string{metav1.DryRunAll}})
+		_, err := options.Tenant1Client.CoreV1().Services(options.TenantNamespace).Create(context.TODO(), svc, metav1.CreateOptions{DryRun: []string{metav1.DryRunAll}})
 
 		if err == nil {
 			return fmt.Errorf("Tenant must be unable to create service of type NodePort")

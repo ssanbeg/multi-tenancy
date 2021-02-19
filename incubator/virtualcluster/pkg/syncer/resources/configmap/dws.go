@@ -1,5 +1,5 @@
 /*
-Copyright 2019 The Kubernetes Authors.
+Copyright 2021 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -28,14 +28,15 @@ import (
 
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/constants"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/conversion"
-	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/reconciler"
+	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/util"
+	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/reconciler"
 )
 
 func (c *controller) StartDWS(stopCh <-chan struct{}) error {
 	if !cache.WaitForCacheSync(stopCh, c.configMapSynced) {
 		return fmt.Errorf("failed to wait for caches to sync")
 	}
-	return c.multiClusterConfigMapController.Start(stopCh)
+	return c.MultiClusterController.Start(stopCh)
 }
 
 // The reconcile logic for tenant master configMap informer
@@ -52,7 +53,7 @@ func (c *controller) Reconcile(request reconciler.Request) (reconciler.Result, e
 		pExists = false
 	}
 	vExists := true
-	vConfigMapObj, err := c.multiClusterConfigMapController.Get(request.ClusterName, request.Namespace, request.Name)
+	vConfigMapObj, err := c.MultiClusterController.Get(request.ClusterName, request.Namespace, request.Name)
 	if err != nil {
 		if !errors.IsNotFound(err) {
 			return reconciler.Result{Requeue: true}, err
@@ -87,11 +88,11 @@ func (c *controller) Reconcile(request reconciler.Request) (reconciler.Result, e
 }
 
 func (c *controller) reconcileConfigMapCreate(clusterName, targetNamespace, requestUID string, configMap *v1.ConfigMap) error {
-	vcName, _, _, err := c.multiClusterConfigMapController.GetOwnerInfo(clusterName)
+	vcName, vcNS, _, err := c.MultiClusterController.GetOwnerInfo(clusterName)
 	if err != nil {
 		return err
 	}
-	newObj, err := conversion.BuildMetadata(clusterName, vcName, targetNamespace, configMap)
+	newObj, err := conversion.BuildMetadata(clusterName, vcNS, vcName, targetNamespace, configMap)
 	if err != nil {
 		return err
 	}
@@ -112,11 +113,11 @@ func (c *controller) reconcileConfigMapUpdate(clusterName, targetNamespace, requ
 	if pConfigMap.Annotations[constants.LabelUID] != requestUID {
 		return fmt.Errorf("pConfigMap %s/%s delegated UID is different from updated object.", targetNamespace, pConfigMap.Name)
 	}
-	spec, err := c.multiClusterConfigMapController.GetSpec(clusterName)
+	vc, err := util.GetVirtualClusterObject(c.MultiClusterController, clusterName)
 	if err != nil {
 		return err
 	}
-	updatedConfigMap := conversion.Equality(c.config, spec).CheckConfigMapEquality(pConfigMap, vConfigMap)
+	updatedConfigMap := conversion.Equality(c.Config, vc).CheckConfigMapEquality(pConfigMap, vConfigMap)
 	if updatedConfigMap != nil {
 		pConfigMap, err = c.configMapClient.ConfigMaps(targetNamespace).Update(context.TODO(), updatedConfigMap, metav1.UpdateOptions{})
 		if err != nil {

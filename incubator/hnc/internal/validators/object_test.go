@@ -3,12 +3,17 @@ package validators
 import (
 	"context"
 	"testing"
+	"time"
 
 	. "github.com/onsi/gomega"
-	admissionv1beta1 "k8s.io/api/admission/v1beta1"
+	k8sadm "k8s.io/api/admission/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 	"sigs.k8s.io/multi-tenancy/incubator/hnc/internal/foresttest"
@@ -30,7 +35,7 @@ func TestType(t *testing.T) {
 	}
 	f := forest.NewForest()
 	f.AddTypeSyncer(or)
-	l := zap.Logger(false)
+	l := zap.New()
 	o := &Object{Forest: f, Log: l}
 
 	tests := []struct {
@@ -62,11 +67,11 @@ func TestType(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			// Setup
-			g := NewGomegaWithT(t)
+			g := NewWithT(t)
 			if tc.ns == "" {
 				tc.ns = "default"
 			}
-			req := admission.Request{AdmissionRequest: admissionv1beta1.AdmissionRequest{
+			req := admission.Request{AdmissionRequest: k8sadm.AdmissionRequest{
 				Name:      "foo",
 				Namespace: tc.ns,
 				Kind:      metav1.GroupVersionKind{Version: tc.version, Kind: tc.kind},
@@ -86,7 +91,7 @@ func TestType(t *testing.T) {
 func TestInheritedFromLabel(t *testing.T) {
 	f := forest.NewForest()
 	o := &Object{Forest: f}
-	l := zap.Logger(false)
+	l := zap.New()
 
 	tests := []struct {
 		name      string
@@ -122,7 +127,7 @@ func TestInheritedFromLabel(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			// Setup
-			g := NewGomegaWithT(t)
+			g := NewWithT(t)
 			oldInst := &unstructured.Unstructured{}
 			metadata.SetLabel(oldInst, tc.oldLabel, tc.oldValue)
 			inst := &unstructured.Unstructured{}
@@ -130,7 +135,7 @@ func TestInheritedFromLabel(t *testing.T) {
 			metadata.SetLabel(inst, tc.newLabel, tc.newValue)
 
 			// Test
-			got := o.handle(context.Background(), l, admissionv1beta1.Update, inst, oldInst)
+			got := o.handle(context.Background(), l, k8sadm.Update, inst, oldInst)
 
 			// Report
 			code := got.AdmissionResponse.Result.Code
@@ -145,13 +150,14 @@ func TestInheritedFromLabel(t *testing.T) {
 func TestUserChanges(t *testing.T) {
 	f := forest.NewForest()
 	o := &Object{Forest: f}
-	l := zap.Logger(false)
+	l := zap.New()
 
 	tests := []struct {
-		name    string
-		oldInst *unstructured.Unstructured
-		inst    *unstructured.Unstructured
-		fail    bool
+		name       string
+		oldInst    *unstructured.Unstructured
+		inst       *unstructured.Unstructured
+		fail       bool
+		isDeleting bool
 	}{{
 		name: "Allow changes to original objects",
 		oldInst: &unstructured.Unstructured{
@@ -273,8 +279,22 @@ func TestUserChanges(t *testing.T) {
 			},
 		},
 	}, {
-		name: "Deny deletions of propagated objects",
+		name: "Deny deletions of propagated objects when namespace is not being deleted",
 		fail: true,
+		oldInst: &unstructured.Unstructured{
+			Object: map[string]interface{}{
+				"apiVersion": "v1",
+				"kind":       "Pod",
+				"metadata": map[string]interface{}{
+					"labels": map[string]interface{}{
+						api.LabelInheritedFrom: "foo",
+					},
+				},
+			},
+		},
+	}, {
+		name:       "Allow deletions of propagated objects when namespace is being deleted",
+		isDeleting: true,
 		oldInst: &unstructured.Unstructured{
 			Object: map[string]interface{}{
 				"apiVersion": "v1",
@@ -542,15 +562,18 @@ func TestUserChanges(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			// Setup
-			g := NewGomegaWithT(t)
-			op := admissionv1beta1.Update
+			g := NewWithT(t)
+			op := k8sadm.Update
 			if tc.inst == nil {
-				op = admissionv1beta1.Delete
+				op = k8sadm.Delete
 				tc.inst = &unstructured.Unstructured{}
 			} else if tc.oldInst == nil {
-				op = admissionv1beta1.Create
+				op = k8sadm.Create
 				tc.oldInst = &unstructured.Unstructured{}
 			}
+
+			c := fakeNSClient{isDeleting: tc.isDeleting}
+			o.client = c
 			// Test
 			got := o.handle(context.Background(), l, op, tc.inst, tc.oldInst)
 			// Report
@@ -561,6 +584,48 @@ func TestUserChanges(t *testing.T) {
 			g.Expect(got.AdmissionResponse.Allowed).ShouldNot(Equal(tc.fail))
 		})
 	}
+}
+
+type fakeNSClient struct {
+	isDeleting bool
+}
+
+// Get decodes given client.Object as corev1.Namespace that might contains deletionTimestamp
+func (c fakeNSClient) Get(_ context.Context, key client.ObjectKey, obj client.Object) error {
+	nsObj := obj.(*corev1.Namespace)
+	if c.isDeleting {
+		nsObj.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+	}
+
+	return nil
+}
+
+func (fakeNSClient) Create(_ context.Context, _ client.Object, _ ...client.CreateOption) error {
+	return nil
+}
+func (fakeNSClient) Update(_ context.Context, _ client.Object, _ ...client.UpdateOption) error {
+	return nil
+}
+func (fakeNSClient) Delete(_ context.Context, _ client.Object, _ ...client.DeleteOption) error {
+	return nil
+}
+func (fakeNSClient) DeleteAllOf(_ context.Context, _ client.Object, _ ...client.DeleteAllOfOption) error {
+	return nil
+}
+func (fakeNSClient) Patch(_ context.Context, _ client.Object, _ client.Patch, _ ...client.PatchOption) error {
+	return nil
+}
+func (fakeNSClient) List(_ context.Context, _ client.ObjectList, _ ...client.ListOption) error {
+	return nil
+}
+func (fakeNSClient) Status() client.StatusWriter {
+	return nil
+}
+func (fakeNSClient) RESTMapper() meta.RESTMapper {
+	return nil
+}
+func (fakeNSClient) Scheme() *runtime.Scheme {
+	return nil
 }
 
 func TestCreatingConflictSource(t *testing.T) {
@@ -625,12 +690,12 @@ func TestCreatingConflictSource(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			// Setup
-			g := NewGomegaWithT(t)
+			g := NewWithT(t)
 			f := foresttest.Create(tc.forest)
 			createSecret(tc.conflictInstName, tc.conflictNamespace, f)
 			o := &Object{Forest: f}
-			l := zap.Logger(false)
-			op := admissionv1beta1.Create
+			l := zap.New()
+			op := k8sadm.Create
 			inst := &unstructured.Unstructured{}
 			inst.SetName(tc.newInstName)
 			inst.SetNamespace(tc.newInstNamespace)

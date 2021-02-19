@@ -1,5 +1,5 @@
 /*
-Copyright 2019 The Kubernetes Authors.
+Copyright 2021 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -29,6 +29,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -40,31 +41,27 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog"
 
+	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/apis/tenancy/v1alpha1"
 	vcclient "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/client/clientset/versioned"
 	vcinformers "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/client/informers/externalversions/tenancy/v1alpha1"
 	vclisters "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/client/listers/tenancy/v1alpha1"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/apis/config"
-	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/cluster"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/constants"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/conversion"
-	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/listener"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/manager"
-	mc "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/mccontroller"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/metrics"
-	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/resources"
-	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/util"
+	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/util/featuregate"
+	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/cluster"
+	utilconst "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/constants"
+	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/listener"
+	mc "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/mccontroller"
+	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/plugin"
 )
 
 var (
 	numHealthCluster   uint64
 	numUnHealthCluster uint64
-	SuperClusterID     string
-)
-
-const (
-	SuperClusterInfoCfgMap = "supercluster-info"
-	SuperClusterIDKey      = "id"
 )
 
 type Syncer struct {
@@ -84,6 +81,20 @@ type Syncer struct {
 	clusterSet map[string]mc.ClusterInterface
 }
 
+type virtualclusterGetter struct {
+	lister vclisters.VirtualClusterLister
+}
+
+var _ mc.Getter = &virtualclusterGetter{}
+
+func (v *virtualclusterGetter) GetObject(namespace, name string) (runtime.Object, error) {
+	vc, err := v.lister.VirtualClusters(namespace).Get(name)
+	if err != nil {
+		return nil, err
+	}
+	return vc, nil
+}
+
 // Bootstrap is a bootstrapping interface for syncer, targets the initialization protocol
 type Bootstrap interface {
 	ListenAndServe(address, certFile, keyFile string)
@@ -98,7 +109,7 @@ func New(
 	superMasterClient clientset.Interface,
 	superMasterInformers informers.SharedInformerFactory,
 	recorder record.EventRecorder,
-) *Syncer {
+) (*Syncer, error) {
 	syncer := &Syncer{
 		config:      config,
 		superClient: superClient,
@@ -130,9 +141,49 @@ func New(
 	multiClusterControllerManager := manager.New()
 	syncer.controllerManager = multiClusterControllerManager
 
-	resources.Register(config, superMasterClient, superMasterInformers, virtualClusterClient, virtualClusterInformer, multiClusterControllerManager)
+	plugins := LoadPlugins(config)
+	initContext := &plugin.InitContext{
+		Context:    context.Background(),
+		Config:     config,
+		Client:     superMasterClient,
+		Informer:   superMasterInformers,
+		VCClient:   virtualClusterClient,
+		VCInformer: virtualClusterInformer,
+	}
 
-	return syncer
+	for _, p := range plugins {
+		klog.Infof("loading plugin %q...", p.ID)
+
+		result := p.Init(initContext)
+		instance, err := result.Instance()
+		if err != nil {
+			klog.Errorf("failed to load plugin %q", p.ID)
+			return nil, err
+		}
+
+		s, ok := instance.(manager.ResourceSyncer)
+		if ok {
+			multiClusterControllerManager.AddResourceSyncer(s)
+		} else {
+			klog.Warningf("unrecognized plugin %q", p.ID)
+		}
+	}
+
+	return syncer, nil
+}
+
+func LoadPlugins(config *config.SyncerConfiguration) []*plugin.Registration {
+	allPlugin := plugin.SyncerResourceRegister.List()
+	var enablePlugin []*plugin.Registration
+	extraSets := sets.NewString(config.ExtraSyncingResources...)
+
+	for i, r := range allPlugin {
+		if !r.Disable || extraSets.Has(r.ID) {
+			enablePlugin = append(enablePlugin, allPlugin[i])
+		}
+	}
+
+	return enablePlugin
 }
 
 // enqueue deleted and running object.
@@ -162,16 +213,16 @@ func (s *Syncer) enqueueVirtualCluster(obj interface{}) {
 
 // Run begins watching and downward&upward syncing.
 func (s *Syncer) Run(stopChan <-chan struct{}) {
-	if feature.Enabled(s.config.FeatureGates, feature.SuperClusterPooling) {
-		klog.Infof("SuperClusterPooling feature is enabled!")
-		cfg, err := s.superClient.ConfigMaps("kube-system").Get(context.TODO(), SuperClusterInfoCfgMap, metav1.GetOptions{})
+	if featuregate.DefaultFeatureGate.Enabled(featuregate.SuperClusterPooling) {
+		klog.Infof("SuperClusterPooling featuregate is enabled!")
+		cfg, err := s.superClient.ConfigMaps("kube-system").Get(context.TODO(), utilconst.SuperClusterInfoCfgMap, metav1.GetOptions{})
 		if err != nil {
-			klog.Infof("Fail to get configmap kube-system/%v from super cluster which is required for SuperClusterPooling feature. Quit!", SuperClusterInfoCfgMap)
+			klog.Infof("Fail to get configmap kube-system/%v from super cluster which is required for SuperClusterPooling feature. Quit!", utilconst.SuperClusterInfoCfgMap)
 			os.Exit(1)
 		}
 		var ok bool
-		if SuperClusterID, ok = cfg.Data[SuperClusterIDKey]; ok == false {
-			klog.Infof("Fail to get ID value from configmap kube-system/%v. Quit!", SuperClusterInfoCfgMap)
+		if utilconst.SuperClusterID, ok = cfg.Data[utilconst.SuperClusterIDKey]; ok == false {
+			klog.Infof("Fail to get ID value from configmap kube-system/%v. Quit!", utilconst.SuperClusterInfoCfgMap)
 			os.Exit(1)
 		}
 	}
@@ -306,13 +357,12 @@ func (s *Syncer) addCluster(key string, vc *v1alpha1.VirtualCluster) error {
 	if err != nil {
 		return err
 	}
-
-	tenantCluster, err := cluster.NewTenantCluster(clusterName, vc.Namespace, vc.Name, string(vc.UID), s.lister, adminKubeConfigBytes, cluster.Options{})
+	tenantCluster, err := cluster.NewCluster(clusterName, vc.Namespace, vc.Name, string(vc.UID), &virtualclusterGetter{lister: s.lister}, adminKubeConfigBytes, cluster.Options{})
 	if err != nil {
 		return fmt.Errorf("failed to new tenant cluster %s/%s: %v", vc.Namespace, vc.Name, err)
 	}
 
-	// for each resource type of the newly added VirtualCluster, we add a listener
+	// for each resource type of the newly added VirtualCluster, we add the object to informer cache.
 	for _, clusterChangeListener := range listener.Listeners {
 		clusterChangeListener.AddCluster(tenantCluster)
 	}
@@ -347,6 +397,12 @@ func (s *Syncer) runCluster(cluster *cluster.Cluster, vc *v1alpha1.VirtualCluste
 		return
 	}
 	cluster.SetSynced()
+	klog.Infof("cluster %s cache sync done", cluster.GetClusterName())
+
+	// start watching cluster resource event after cache sync done.
+	for _, clusterChangeListener := range listener.Listeners {
+		clusterChangeListener.WatchCluster(cluster)
+	}
 }
 
 func (s *Syncer) healthPatrol() {

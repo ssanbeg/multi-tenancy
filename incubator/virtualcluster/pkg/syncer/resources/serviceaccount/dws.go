@@ -28,14 +28,14 @@ import (
 
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/constants"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/conversion"
-	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/reconciler"
+	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/reconciler"
 )
 
 func (c *controller) StartDWS(stopCh <-chan struct{}) error {
 	if !cache.WaitForCacheSync(stopCh, c.saSynced) {
 		return fmt.Errorf("failed to wait for sa caches to sync")
 	}
-	return c.multiClusterServiceAccountController.Start(stopCh)
+	return c.MultiClusterController.Start(stopCh)
 }
 
 // The reconcile logic for tenant master service account informer
@@ -51,7 +51,7 @@ func (c *controller) Reconcile(request reconciler.Request) (reconciler.Result, e
 		pExists = false
 	}
 	vExists := true
-	vSaObj, err := c.multiClusterServiceAccountController.Get(request.ClusterName, request.Namespace, request.Name)
+	vSaObj, err := c.MultiClusterController.Get(request.ClusterName, request.Namespace, request.Name)
 	if err != nil {
 		if !errors.IsNotFound(err) {
 			return reconciler.Result{Requeue: true}, err
@@ -86,11 +86,11 @@ func (c *controller) Reconcile(request reconciler.Request) (reconciler.Result, e
 }
 
 func (c *controller) reconcileServiceAccountCreate(clusterName, targetNamespace, requestUID string, vSa *v1.ServiceAccount) error {
-	vcName, _, _, err := c.multiClusterServiceAccountController.GetOwnerInfo(clusterName)
+	vcName, vcNS, _, err := c.MultiClusterController.GetOwnerInfo(clusterName)
 	if err != nil {
 		return err
 	}
-	newObj, err := conversion.BuildMetadata(clusterName, vcName, targetNamespace, vSa)
+	newObj, err := conversion.BuildMetadata(clusterName, vcNS, vcName, targetNamespace, vSa)
 	if err != nil {
 		return err
 	}

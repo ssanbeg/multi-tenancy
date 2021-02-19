@@ -84,7 +84,7 @@ type HierarchyConfigReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=namespaces,verbs=get;list;watch;update;patch
 
 // Reconcile sets up some basic variables and then calls the business logic.
-func (r *HierarchyConfigReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
+func (r *HierarchyConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	if config.EX[req.Namespace] {
 		return ctrl.Result{}, nil
 	}
@@ -92,7 +92,6 @@ func (r *HierarchyConfigReconciler) Reconcile(req ctrl.Request) (ctrl.Result, er
 	stats.StartHierConfigReconcile()
 	defer stats.StopHierConfigReconcile()
 
-	ctx := context.Background()
 	ns := req.NamespacedName.Namespace
 
 	log := loggerWithRID(r.Log).WithValues("ns", ns)
@@ -217,9 +216,6 @@ func (r *HierarchyConfigReconciler) syncWithForest(log logr.Logger, nsInst *core
 	hadCrit := ns.HasLocalCritCondition()
 	ns.ClearConditions()
 
-	// Record whether the namespace is being deleted; this is useful for object validators.
-	ns.IsDeleting = !nsInst.DeletionTimestamp.IsZero()
-
 	// Set external tree labels in the forest if this is an external namespace.
 	r.syncExternalNamespace(log, nsInst, ns)
 
@@ -302,7 +298,7 @@ func (r *HierarchyConfigReconciler) syncSubnamespaceParent(log logr.Logger, inst
 	// We could also add an exception to allow K8s SAs to override the object validator (and we
 	// probably should), but this prevents us from getting into a war with K8s and is sufficient for
 	// v0.5.
-	if pnm != "" && ns.IsDeleting {
+	if pnm != "" && !nsInst.DeletionTimestamp.IsZero() {
 		log.V(1).Info("Subnamespace is being deleted; ignoring SubnamespaceOf annotation", "parent", inst.Spec.Parent, "annotation", pnm)
 		pnm = ""
 	}
@@ -520,7 +516,7 @@ func (r *HierarchyConfigReconciler) enqueueAffected(log logr.Logger, reason stri
 			inst := &api.HierarchyConfiguration{}
 			inst.ObjectMeta.Name = api.Singleton
 			inst.ObjectMeta.Namespace = nm
-			r.Affected <- event.GenericEvent{Meta: inst}
+			r.Affected <- event.GenericEvent{Object: inst}
 		}
 	}()
 }
@@ -671,33 +667,31 @@ func (r *HierarchyConfigReconciler) getAnchorNames(ctx context.Context, nm strin
 
 func (r *HierarchyConfigReconciler) SetupWithManager(mgr ctrl.Manager, maxReconciles int) error {
 	// Maps namespaces to their singletons
-	nsMapFn := handler.ToRequestsFunc(
-		func(a handler.MapObject) []reconcile.Request {
-			return []reconcile.Request{
-				{NamespacedName: types.NamespacedName{
-					Name:      api.Singleton,
-					Namespace: a.Meta.GetName(),
-				}},
-			}
-		})
+	nsMapFn := func(obj client.Object) []reconcile.Request {
+		return []reconcile.Request{
+			{NamespacedName: types.NamespacedName{
+				Name:      api.Singleton,
+				Namespace: obj.GetName(),
+			}},
+		}
+	}
 	// Maps a subnamespace anchor to the parent singleton.
-	anchorMapFn := handler.ToRequestsFunc(
-		func(a handler.MapObject) []reconcile.Request {
-			return []reconcile.Request{
-				{NamespacedName: types.NamespacedName{
-					Name:      api.Singleton,
-					Namespace: a.Meta.GetNamespace(),
-				}},
-			}
-		})
+	anchorMapFn := func(obj client.Object) []reconcile.Request {
+		return []reconcile.Request{
+			{NamespacedName: types.NamespacedName{
+				Name:      api.Singleton,
+				Namespace: obj.GetNamespace(),
+			}},
+		}
+	}
 	opts := controller.Options{
 		MaxConcurrentReconciles: maxReconciles,
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&api.HierarchyConfiguration{}).
 		Watches(&source.Channel{Source: r.Affected}, &handler.EnqueueRequestForObject{}).
-		Watches(&source.Kind{Type: &corev1.Namespace{}}, &handler.EnqueueRequestsFromMapFunc{ToRequests: nsMapFn}).
-		Watches(&source.Kind{Type: &api.SubnamespaceAnchor{}}, &handler.EnqueueRequestsFromMapFunc{ToRequests: anchorMapFn}).
+		Watches(&source.Kind{Type: &corev1.Namespace{}}, handler.EnqueueRequestsFromMapFunc(nsMapFn)).
+		Watches(&source.Kind{Type: &api.SubnamespaceAnchor{}}, handler.EnqueueRequestsFromMapFunc(anchorMapFn)).
 		WithOptions(opts).
 		Complete(r)
 }

@@ -32,20 +32,14 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/validation"
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
 	listersv1 "k8s.io/client-go/listers/core/v1"
 
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/apis/tenancy/v1alpha1"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/constants"
+	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/util/featuregate"
 )
-
-const (
-	masterServiceNamespace = metav1.NamespaceDefault
-)
-
-var masterServices = sets.NewString("kubernetes")
 
 // ToClusterKey makes a unique key which is used to create the root namespace in super master for a virtual cluster.
 // To avoid name conflict, the key uses the format <namespace>-<hash>-<name>
@@ -102,7 +96,7 @@ func GetKubeConfigOfVC(c v1core.CoreV1Interface, vc *v1alpha1.VirtualCluster) ([
 	return adminKubeConfigSecret.Data[constants.KubeconfigAdminSecretName], nil
 }
 
-func BuildMetadata(cluster, vcname, targetNamespace string, obj runtime.Object) (runtime.Object, error) {
+func BuildMetadata(cluster, vcns, vcname, targetNamespace string, obj runtime.Object) (runtime.Object, error) {
 	target := obj.DeepCopyObject()
 	m, err := meta.Accessor(target)
 	if err != nil {
@@ -120,6 +114,7 @@ func BuildMetadata(cluster, vcname, targetNamespace string, obj runtime.Object) 
 		constants.LabelOwnerReferences: string(ownerReferencesStr),
 		constants.LabelNamespace:       m.GetNamespace(),
 		constants.LabelVCName:          vcname,
+		constants.LabelVCNamespace:     vcns,
 	}
 
 	ResetMetadata(m)
@@ -141,7 +136,8 @@ func BuildMetadata(cluster, vcname, targetNamespace string, obj runtime.Object) 
 		labels = make(map[string]string)
 	}
 	var tenantScopeMetaInLabel = map[string]string{
-		constants.LabelVCName: vcname,
+		constants.LabelVCName:      vcname,
+		constants.LabelVCNamespace: vcns,
 	}
 	for k, v := range tenantScopeMetaInLabel {
 		labels[k] = v
@@ -217,11 +213,27 @@ func BuildVirtualPriorityClass(cluster string, pPriorityClass *v1scheduling.Prio
 	return vPriorityClass
 }
 
-func BuildVirtualPersistentVolume(cluster, vcName string, pPV *v1.PersistentVolume, vPVC *v1.PersistentVolumeClaim) *v1.PersistentVolume {
-	vPVobj, _ := BuildMetadata(cluster, vcName, "", pPV)
+func BuildVirtualPersistentVolume(cluster, vcNS, vcName string, pPV *v1.PersistentVolume, vPVC *v1.PersistentVolumeClaim) *v1.PersistentVolume {
+	vPVobj, _ := BuildMetadata(cluster, vcNS, vcName, "", pPV)
 	vPV := vPVobj.(*v1.PersistentVolume)
 	// The pv needs to bind with the vPVC
 	vPV.Spec.ClaimRef.Namespace = vPVC.Namespace
 	vPV.Spec.ClaimRef.UID = vPVC.UID
 	return vPV
+}
+
+// IsControlPlaneService will return if the namespacedName matches the proper
+// NamespacedName in the tenant control plane
+func IsControlPlaneService(service *v1.Service, cluster string) bool {
+	kubernetesNamespace := ToSuperMasterNamespace(cluster, metav1.NamespaceDefault)
+	kubernetesService := "kubernetes"
+
+	// If the super cluster service networking is enabled this supports allowing
+	// the "real" apiserver-svc to propagate to the tenant default/kubernetes service
+	if featuregate.DefaultFeatureGate.Enabled(featuregate.SuperClusterServiceNetwork) {
+		kubernetesNamespace = cluster
+		kubernetesService = "apiserver-svc"
+	}
+
+	return service.Namespace == kubernetesNamespace && service.Name == kubernetesService
 }

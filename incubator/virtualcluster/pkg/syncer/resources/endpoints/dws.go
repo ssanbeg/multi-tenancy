@@ -1,5 +1,5 @@
 /*
-Copyright 2019 The Kubernetes Authors.
+Copyright 2021 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -28,19 +28,20 @@ import (
 
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/constants"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/conversion"
-	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/reconciler"
+	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/util"
+	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/reconciler"
 )
 
 func (c *controller) StartDWS(stopCh <-chan struct{}) error {
 	if !cache.WaitForCacheSync(stopCh, c.endpointsSynced) {
 		return fmt.Errorf("failed to wait for caches to sync")
 	}
-	return c.multiClusterEndpointsController.Start(stopCh)
+	return c.MultiClusterController.Start(stopCh)
 }
 
 // The reconcile logic for tenant master endpoints informer
 func (c *controller) Reconcile(request reconciler.Request) (reconciler.Result, error) {
-	vServiceObj, err := c.multiClusterEndpointsController.GetByObjectType(request.ClusterName, request.Namespace, request.Name, &v1.Service{})
+	vServiceObj, err := c.MultiClusterController.GetByObjectType(request.ClusterName, request.Namespace, request.Name, &v1.Service{})
 	if err != nil && !errors.IsNotFound(err) {
 		return reconciler.Result{Requeue: true}, fmt.Errorf("fail to query service from tenant master %s", request.ClusterName)
 	}
@@ -62,7 +63,7 @@ func (c *controller) Reconcile(request reconciler.Request) (reconciler.Result, e
 		pExists = false
 	}
 	vExists := true
-	vEndpointsObj, err := c.multiClusterEndpointsController.Get(request.ClusterName, request.Namespace, request.Name)
+	vEndpointsObj, err := c.MultiClusterController.Get(request.ClusterName, request.Namespace, request.Name)
 	if err != nil {
 		if !errors.IsNotFound(err) {
 			return reconciler.Result{Requeue: true}, err
@@ -97,11 +98,11 @@ func (c *controller) Reconcile(request reconciler.Request) (reconciler.Result, e
 }
 
 func (c *controller) reconcileEndpointsCreate(clusterName, targetNamespace, requestUID string, ep *v1.Endpoints) error {
-	vcName, _, _, err := c.multiClusterEndpointsController.GetOwnerInfo(clusterName)
+	vcName, vcNS, _, err := c.MultiClusterController.GetOwnerInfo(clusterName)
 	if err != nil {
 		return err
 	}
-	newObj, err := conversion.BuildMetadata(clusterName, vcName, targetNamespace, ep)
+	newObj, err := conversion.BuildMetadata(clusterName, vcNS, vcName, targetNamespace, ep)
 	if err != nil {
 		return err
 	}
@@ -124,11 +125,11 @@ func (c *controller) reconcileEndpointsUpdate(clusterName, targetNamespace, requ
 	if pEP.Annotations[constants.LabelUID] != requestUID {
 		return fmt.Errorf("pEndpoints %s/%s delegated UID is different from updated object.", targetNamespace, pEP.Name)
 	}
-	spec, err := c.multiClusterEndpointsController.GetSpec(clusterName)
+	vc, err := util.GetVirtualClusterObject(c.MultiClusterController, clusterName)
 	if err != nil {
 		return err
 	}
-	updatedEndpoints := conversion.Equality(c.config, spec).CheckEndpointsEquality(pEP, vEP)
+	updatedEndpoints := conversion.Equality(c.Config, vc).CheckEndpointsEquality(pEP, vEP)
 	if updatedEndpoints != nil {
 		pEP, err = c.endpointClient.Endpoints(targetNamespace).Update(context.TODO(), updatedEndpoints, metav1.UpdateOptions{})
 		if err != nil {

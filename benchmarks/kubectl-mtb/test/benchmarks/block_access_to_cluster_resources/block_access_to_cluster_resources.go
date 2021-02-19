@@ -20,9 +20,9 @@ var b = &benchmark.Benchmark{
 		return nil
 	},
 	Run: func(options types.RunOptions) error {
-		resources := []utils.GroupResource{}
+		var resources []utils.GroupResource
 
-		lists, err := options.KClient.Discovery().ServerPreferredResources()
+		lists, err := options.ClusterAdminClient.Discovery().ServerPreferredResources()
 		if err != nil {
 			options.Logger.Debug(err.Error())
 			return err
@@ -51,18 +51,11 @@ var b = &benchmark.Benchmark{
 			}
 		}
 
-		for _, resource := range resources {
-			for _, verb := range verbs {
-				access, msg, err := utils.RunAccessCheck(options.TClient, "", resource, verb)
-				if err != nil {
-					options.Logger.Debug(err.Error())
-					return err
-				}
-				if access {
-					return fmt.Errorf(msg)
-				}
-			}
+		err = utils.CheckAccessOnResourcesInNamespace(options.Tenant1Client, "", resources, verbs)
+		if err != nil {
+			return err
 		}
+
 		return nil
 	},
 }

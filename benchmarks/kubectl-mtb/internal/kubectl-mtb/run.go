@@ -66,7 +66,7 @@ func initConfig() error {
 	}
 
 	// create the K8s clientset
-	benchmarkRunOptions.KClient, err = kubernetes.NewForConfig(config)
+	benchmarkRunOptions.ClusterAdminClient, err = kubernetes.NewForConfig(config)
 	if err != nil {
 		return err
 	}
@@ -75,9 +75,19 @@ func initConfig() error {
 	tenantConfig.Impersonate.UserName = benchmarkRunOptions.Tenant
 
 	// create the tenant clientset
-	benchmarkRunOptions.TClient, err = kubernetes.NewForConfig(tenantConfig)
+	benchmarkRunOptions.Tenant1Client, err = kubernetes.NewForConfig(tenantConfig)
 	if err != nil {
 		return err
+	}
+
+	if benchmarkRunOptions.OtherNamespace != "" && benchmarkRunOptions.OtherTenant != "" {
+		otherTenantConfig := config
+		otherTenantConfig.Impersonate.UserName = benchmarkRunOptions.OtherTenant
+
+		benchmarkRunOptions.Tenant2Client, err = kubernetes.NewForConfig(tenantConfig)
+		if err != nil {
+			return err
+		}
 	}
 
 	return err
@@ -120,14 +130,27 @@ func removeBenchmarksWithIDs(ids []string) {
 
 // Validation of the flag inputs
 func validateFlags(cmd *cobra.Command) error {
-	benchmarkRunOptions.Tenant, _ = cmd.Flags().GetString("as")
-	if benchmarkRunOptions.Tenant == "" {
-		return fmt.Errorf("username must be set via --as")
+	tenants, _ := cmd.Flags().GetStringSlice("as")
+	tenantNamespaces, _ := cmd.Flags().GetStringSlice("namespace")
+
+	if len(tenants) < 1 || len(tenantNamespaces) < 1 {
+		return fmt.Errorf("user and namespace required")
 	}
 
-	benchmarkRunOptions.TenantNamespace, _ = cmd.Flags().GetString("namespace")
-	if benchmarkRunOptions.TenantNamespace == "" {
-		return fmt.Errorf("tenant namespace must be set via --namespace or -n")
+	if len(tenants) != len(tenantNamespaces) {
+		return fmt.Errorf("user and namespace counts must be equal")
+	}
+
+	if len(tenants) > 2 || len(tenantNamespaces) > 2 {
+		return fmt.Errorf("user and namespace counts cannot exceed 2")
+	}
+
+	benchmarkRunOptions.Tenant = tenants[0]
+	benchmarkRunOptions.TenantNamespace = tenantNamespaces[0]
+
+	if len(tenants) > 1 {
+		benchmarkRunOptions.OtherTenant = tenants[1]
+		benchmarkRunOptions.OtherNamespace = tenantNamespaces[1]
 	}
 
 	err := initConfig()
@@ -135,7 +158,7 @@ func validateFlags(cmd *cobra.Command) error {
 		return err
 	}
 
-	_, err = benchmarkRunOptions.KClient.CoreV1().Namespaces().Get(context.TODO(), benchmarkRunOptions.TenantNamespace, metav1.GetOptions{})
+	_, err = benchmarkRunOptions.ClusterAdminClient.CoreV1().Namespaces().Get(context.TODO(), benchmarkRunOptions.TenantNamespace, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("invalid namespace")
 	}
@@ -274,12 +297,10 @@ func runTests(cmd *cobra.Command, args []string) error {
 
 func newRunCmd() *cobra.Command {
 	runCmd.Flags().BoolP("debug", "d", false, "Use debugging mode")
-	runCmd.Flags().StringP("namespace", "n", "", "(required) tenant namespace")
-	runCmd.Flags().String("as", "", "(required) user name to impersonate")
+	runCmd.Flags().StringSliceP("namespace", "n", []string{}, "(required) tenant namespace")
+	runCmd.Flags().StringSlice("as", []string{}, "(required) user name to impersonate")
 	runCmd.Flags().StringP("out", "o", "default", "(optional) output reporters (default, policyreport)")
 	runCmd.Flags().StringP("skip", "s", "", "(optional) benchmark IDs to skip")
-	runCmd.Flags().String("other-namespace", "", "(optional) other tenant namespace")
-	runCmd.Flags().String("other-tenant-admin","", "(optional) other tenant admin")
 	runCmd.Flags().StringP("labels", "l", "", "(optional) labels")
 
 	return runCmd

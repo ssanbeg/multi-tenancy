@@ -1,5 +1,5 @@
 /*
-Copyright 2019 The Kubernetes Authors.
+Copyright 2021 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -28,7 +28,8 @@ import (
 
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/constants"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/conversion/envvars"
-	mc "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/mccontroller"
+	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/util"
+	mc "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/mccontroller"
 )
 
 type VCMutateInterface interface {
@@ -161,11 +162,11 @@ func PodMutateDefault(vPod *v1.Pod, saSecretMap map[string]string, services []*v
 			mutateWeightedPodAffinityTerms(p.pPod.Spec.Affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution, p.clusterName)
 		}
 
-		clusterDomain, err := p.mc.GetClusterDomain(p.clusterName)
+		vc, err := util.GetVirtualClusterObject(p.mc, p.clusterName)
 		if err != nil {
 			return err
 		}
-		mutateDNSConfig(p, vPod, clusterDomain, nameServer)
+		mutateDNSConfig(p, vPod, vc.Spec.ClusterDomain, nameServer)
 
 		// FIXME(zhuangqh): how to support pod subdomain.
 		if p.pPod.Spec.Subdomain != "" {
@@ -239,9 +240,6 @@ func getServiceEnvVarMap(ns, cluster string, enableServiceLinks *bool, services 
 		apiServerService string
 	)
 
-	// the master service namespace of the given virtualcluster
-	tenantMasterSvcNs := ToSuperMasterNamespace(cluster, masterServiceNamespace)
-
 	// project the services in namespace ns onto the master services
 	for i := range services {
 		service := services[i]
@@ -251,12 +249,12 @@ func getServiceEnvVarMap(ns, cluster string, enableServiceLinks *bool, services 
 		}
 		serviceName := service.Name
 
-		// We always want to add environment variabled for master services
+		// We always want to add environment variables for master services
 		// from the corresponding master service namespace of the virtualcluster,
 		// even if enableServiceLinks is false.
 		// We also add environment variables for other services in the same
 		// namespace, if enableServiceLinks is true.
-		if service.Namespace == tenantMasterSvcNs && masterServices.Has(serviceName) {
+		if IsControlPlaneService(service, cluster) {
 			apiServerService = service.Spec.ClusterIP
 			if _, exists := serviceMap[serviceName]; !exists {
 				serviceMap[serviceName] = service

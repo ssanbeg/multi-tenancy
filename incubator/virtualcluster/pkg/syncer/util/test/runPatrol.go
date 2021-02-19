@@ -30,11 +30,11 @@ import (
 	fakevcclient "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/client/clientset/versioned/fake"
 	vcinformerFactory "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/client/informers/externalversions"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/apis/config"
-	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/cluster"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/manager"
-	mc "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/mccontroller"
 	pa "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/patrol"
 	uw "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/uwcontroller"
+	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/cluster"
+	mc "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/mccontroller"
 )
 
 type fakePatrolReconciler struct {
@@ -69,6 +69,7 @@ func RunPatrol(
 	waitUWS bool,
 	controllerStateModifyFunc controllerStateModifier,
 ) ([]core.Action, []core.Action, error) {
+	registerDefaultScheme()
 	// setup fake tenant cluster
 	tenantClientset := fake.NewSimpleClientset()
 	tenantClient := fakeClient.NewFakeClient()
@@ -116,14 +117,14 @@ func RunPatrol(
 	fakeDWRc := &fakeReconciler{errCh: syncDWS}
 	fakeUWRc := &fakeUWReconciler{errCh: syncUWS}
 
-	rsOptions := &manager.ResourceSyncerOptions{
+	rsOptions := manager.ResourceSyncerOptions{
 		MCOptions:     &mc.Options{Reconciler: fakeDWRc},
 		UWOptions:     &uw.Options{Reconciler: fakeUWRc},
 		PatrolOptions: &pa.Options{Reconciler: fakePatrolRc},
 		IsFake:        true,
 	}
 
-	resourceSyncer, _, _, err := newControllerFunc(
+	resourceSyncer, err := newControllerFunc(
 		&config.SyncerConfiguration{
 			DisableServiceAccountToken: true,
 		},
@@ -146,15 +147,16 @@ func RunPatrol(
 	}
 
 	// register tenant cluster to controller.
-	resourceSyncer.AddCluster(tenantCluster)
-	defer resourceSyncer.RemoveCluster(tenantCluster)
+	resourceSyncer.GetListener().AddCluster(tenantCluster)
+	resourceSyncer.GetListener().WatchCluster(tenantCluster)
+	defer resourceSyncer.GetListener().RemoveCluster(tenantCluster)
 
 	stopCh := make(chan struct{})
 	defer close(stopCh)
 
 	// add object to super informer.
 	for _, each := range existingObjectInSuper {
-		informer := getObjectInformer(superInformer, each)
+		informer := superInformer.InformerFor(each, nil)
 		informer.GetStore().Add(each)
 	}
 	go resourceSyncer.StartDWS(stopCh)
