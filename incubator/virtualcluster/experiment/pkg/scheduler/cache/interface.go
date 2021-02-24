@@ -21,16 +21,19 @@ import (
 )
 
 type Cache interface {
+	AddTenant(string)
+	RemoveTenant(string) error
 	GetNamespace(string) *Namespace
 	AddNamespace(*Namespace) error
 	RemoveNamespace(*Namespace) error
 	UpdateNamespace(*Namespace, *Namespace) error
 	AddCluster(*Cluster) error
-	RemoveCluster(*Cluster) error
+	RemoveCluster(string) error
 	AddPod(*Pod) error
 	RemovePod(*Pod) error
 	AddProvision(string, string, []*Slice) error
 	RemoveProvision(string, string) error
 	UpdateClusterCapacity(string, v1.ResourceList) error
+	SnapshotForNamespaceSched(...*Namespace) (*NamespaceSchedSnapshot, error)
 	Dump() string
 }
