@@ -75,9 +75,9 @@ func (r *AnchorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// Report "Forbidden" state and early exit if the namespace is not allowed to have subnamespaces
 	// but has bypassed the webhook and successfully created the anchor. Forbidden anchors won't have
 	// finalizers.
-	// TODO refactor/split the EX map for 1) reconciler exclusion and 2) subnamespaces exclusion
-	// purposes. See issue: https://github.com/kubernetes-sigs/multi-tenancy/issues/495
-	if config.EX[pnm] {
+	// TODO refactor/split the ExcludedNamespaces map for 1) reconciler exclusion and 2) subnamespaces exclusion
+	//  purposes. See issue: https://github.com/kubernetes-sigs/multi-tenancy/issues/495
+	if config.ExcludedNamespaces[pnm] {
 		inst.Status.State = api.Forbidden
 		return ctrl.Result{}, r.writeInstance(ctx, log, inst)
 	}
@@ -99,6 +99,12 @@ func (r *AnchorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// If the subnamespace doesn't exist, create it.
 	if inst.Status.State == api.Missing {
 		if err := r.writeNamespace(ctx, log, nm, pnm); err != nil {
+			// Write the "Missing" state to the anchor status if the subnamespace
+			// cannot be created for some reason. Without it, the anchor status will
+			// remain empty by default.
+			if anchorErr := r.writeInstance(ctx, log, inst); anchorErr != nil {
+				log.Error(anchorErr, "while setting anchor state", "state", api.Missing, "reason", err)
+			}
 			return ctrl.Result{}, err
 		}
 	}

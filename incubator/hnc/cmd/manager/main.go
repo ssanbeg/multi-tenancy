@@ -22,11 +22,13 @@ import (
 
 	"contrib.go.opencensus.io/exporter/prometheus"
 	"contrib.go.opencensus.io/exporter/stackdriver"
+	"github.com/go-logr/zapr"
 	corev1 "k8s.io/api/core/v1"
 
 	// Change to use v1 when we only need to support 1.17 and higher kubernetes versions.
+	stdzap "go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
-	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
+	apiextensions "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
@@ -50,17 +52,19 @@ var (
 )
 
 var (
-	metricsAddr            string
-	maxReconciles          int
-	enableLeaderElection   bool
-	leaderElectionId       string
-	novalidation           bool
-	debugLogs              bool
-	testLog                bool
-	internalCert           bool
-	qps                    int
-	webhookServerPort      int
-	restartOnSecretRefresh bool
+	metricsAddr             string
+	maxReconciles           int
+	enableLeaderElection    bool
+	leaderElectionId        string
+	novalidation            bool
+	debugLogs               bool
+	testLog                 bool
+	internalCert            bool
+	qps                     int
+	webhookServerPort       int
+	restartOnSecretRefresh  bool
+	unpropagatedAnnotations arrayArg
+	excludedNamespaces      arrayArg
 )
 
 func init() {
@@ -70,7 +74,7 @@ func init() {
 
 	_ = v1a2.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
-	_ = v1beta1.AddToScheme(scheme)
+	_ = apiextensions.AddToScheme(scheme)
 	// +kubebuilder:scaffold:scheme
 }
 
@@ -89,10 +93,16 @@ func main() {
 	flag.IntVar(&qps, "apiserver-qps-throttle", 50, "The maximum QPS to the API server. See the user guide for more information.")
 	flag.BoolVar(&stats.SuppressObjectTags, "suppress-object-tags", true, "If true, suppresses the kinds of object metrics to reduce metric cardinality. See the user guide for more information.")
 	flag.IntVar(&webhookServerPort, "webhook-server-port", 443, "The port that the webhook server serves at.")
-	uaArg := arrayArg{val: &config.UnpropagatedAnnotations}
-	flag.Var(&uaArg, "unpropagated-annotation", "An annotation that, if present, will be stripped out of any propagated copies of an object. May be specified multiple times, with each instance specifying one annotation. See the user guide for more information.")
+	flag.Var(&unpropagatedAnnotations, "unpropagated-annotation", "An annotation that, if present, will be stripped out of any propagated copies of an object. May be specified multiple times, with each instance specifying one annotation. See the user guide for more information.")
+	flag.Var(&excludedNamespaces, "excluded-namespace", "A namespace that, if present, will be excluded from HNC management. May be specified multiple times, with each instance specifying one namespace. See the user guide for more information.")
 	flag.BoolVar(&restartOnSecretRefresh, "cert-restart-on-secret-refresh", false, "Kills the process when secrets are refreshed so that the pod can be restarted (secrets take up to 60s to be updated by running pods)")
 	flag.Parse()
+	// Assign the array args to the configuration variables after the args are parsed.
+	config.UnpropagatedAnnotations = unpropagatedAnnotations
+	config.ExcludedNamespaces = make(map[string]bool)
+	for _, exn := range excludedNamespaces {
+		config.ExcludedNamespaces[exn] = true
+	}
 
 	// Enable OpenCensus exporters to export metrics
 	// to Stackdriver Monitoring.
@@ -135,7 +145,14 @@ func main() {
 	if debugLogs {
 		logLevel = zapcore.DebugLevel
 	}
-	log := zap.New(zap.Level(logLevel), zap.StacktraceLevel(zapcore.PanicLevel))
+	// Create a raw (upstream) zap logger that we can pass to both
+	// the zap stdlib log redirect and logr.Logger shim we use for controller-runtime.
+	// Stdlib is redirected at ErrorLevel since it should only log
+	// if it can't return an error, like in http.Server before a handler is invoked,
+	// and we expect other libraries to do the same.
+	rawlog := zap.NewRaw(zap.Level(logLevel), zap.StacktraceLevel(zapcore.PanicLevel))
+	stdzap.RedirectStdLogAt(rawlog, zapcore.ErrorLevel)
+	log := zapr.NewLogger(rawlog)
 	ctrl.SetLogger(log)
 	cfg := ctrl.GetConfigOrDie()
 	cfg.QPS = float32(qps)
@@ -209,18 +226,13 @@ func startControllers(mgr ctrl.Manager, certsCreated chan struct{}) {
 // arrayArg is an arg that can be specified multiple times. It implements
 // https://golang.org/pkg/flag/#Value an is based on
 // https://stackoverflow.com/questions/28322997/how-to-get-a-list-of-values-into-a-flag-in-golang.
-type arrayArg struct {
-	val *[]string
-}
+type arrayArg []string
 
-func (a *arrayArg) String() string {
-	if a == nil || a.val == nil {
-		return ""
-	}
-	return strings.Join(*a.val, ",")
+func (a arrayArg) String() string {
+	return strings.Join(a, ", ")
 }
 
 func (a *arrayArg) Set(val string) error {
-	*a.val = append(*a.val, val)
+	*a = append(*a, val)
 	return nil
 }

@@ -35,7 +35,7 @@ type SyncerConfiguration struct {
 
 	// DefaultOpaqueMetaDomains is the default configuration for each Virtual Cluster.
 	// The key prefix of labels or annotations match this domain would be invisible to Virtual Cluster but
-	// are kept in super master.
+	// are kept in super cluster.
 	// take tenant labels(annotations) ["foo=bar", "foo.kubernetes.io/foo=bar"] for example,
 	// different configurations and possible final states are as follows:
 	// DefaultOpaqueMetaDomains | labels(annotations) in super cluster
@@ -51,13 +51,23 @@ type SyncerConfiguration struct {
 	// DisableServiceAccountToken indicates whether disable service account token automatically mounted.
 	DisableServiceAccountToken bool
 
+	// DisablePodServiceLinks indicates whether to disable the `EnableServiceLinks` field in pPod spec.
+	// Defaults to false, it won‘t mutate the EnableServiceLinks field in pPod spec.
+	// If set to true, it will disable service links for all of the pPods to avoid massive env injections
+	// from syncer which replace the kubelet generated envs.
+	DisablePodServiceLinks bool
+
 	// VNAgentPort defines the port that the VN Agent is running on per host
 	VNAgentPort int32
+
+	// VNAgentNamespacedName defines the namespace/name of the VN Agent Kubernetes
+	// service, this is used for feature VNodeProviderService.
+	VNAgentNamespacedName string
 
 	// FeatureGates enabled by the user.
 	FeatureGates map[string]bool
 
-	// Super master rest config
+	// Super cluster rest config
 	RestConfig *rest.Config
 }
 

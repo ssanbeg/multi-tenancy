@@ -36,6 +36,8 @@ import (
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/metrics"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/patrol/differ"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/util"
+	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/util/featuregate"
+	utilconstants "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/constants"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/reconciler"
 )
 
@@ -152,17 +154,23 @@ func (c *controller) PatrollerDo() {
 		pSet.Insert(differ.ClusterObject{Object: p, Key: differ.DefaultClusterObjectKey(p, "")})
 	}
 
-	blockedClusterSet := sets.NewString()
+	knownClusterSet := sets.NewString(clusterNames...)
 	vSet := differ.NewDiffSet()
 	for _, cluster := range clusterNames {
 		listObj, err := c.MultiClusterController.List(cluster)
 		if err != nil {
 			klog.Errorf("error listing pod from cluster %s informer cache: %v", cluster, err)
-			blockedClusterSet.Insert(cluster)
+			knownClusterSet.Insert(cluster)
 			continue
 		}
 		vList := listObj.(*v1.PodList)
 		for i := range vList.Items {
+			if featuregate.DefaultFeatureGate.Enabled(featuregate.SuperClusterPooling) {
+				cname, ok := vList.Items[i].GetAnnotations()[utilconstants.LabelScheduledCluster]
+				if !ok || cname != utilconstants.SuperClusterID {
+					continue
+				}
+			}
 			vSet.Insert(differ.ClusterObject{
 				Object:       &vList.Items[i],
 				OwnerCluster: cluster,
@@ -284,7 +292,7 @@ func (c *controller) PatrollerDo() {
 					c.updateClusterVNodePodMap(obj.GetOwnerCluster(), vPod.Spec.NodeName, string(vPod.UID), reconciler.UpdateEvent)
 				}
 			}
-			return differ.DefaultDifferFilter(blockedClusterSet)(obj)
+			return differ.DefaultDifferFilter(knownClusterSet)(obj)
 		},
 	})
 
@@ -367,6 +375,9 @@ func (c *controller) checkNodesOfTenantCluster(clusterName string) {
 		func() {
 			c.Lock()
 			defer c.Unlock()
+			if featuregate.DefaultFeatureGate.Enabled(featuregate.SuperClusterPooling) && vNode.GetLabels()[constants.LabelSuperClusterID] != utilconstants.SuperClusterID {
+				return
+			}
 			if _, exist := c.clusterVNodePodMap[clusterName]; exist {
 				if _, exist := c.clusterVNodePodMap[clusterName][vNode.Name]; exist {
 					// Active Node

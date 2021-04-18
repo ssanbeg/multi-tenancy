@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/conversion"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/metrics"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/patrol/differ"
+	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/util"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/util/featuregate"
 	utilconstants "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/constants"
 	mc "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/mccontroller"
@@ -96,13 +97,13 @@ func (c *controller) PatrollerDo() {
 		pSet.Insert(differ.ClusterObject{Object: p, Key: p.GetName()})
 	}
 
-	blockedClusterSet := sets.NewString()
+	knownClusterSet := sets.NewString(clusterNames...)
 	vSet := differ.NewDiffSet()
 	for _, cluster := range clusterNames {
 		listObj, err := c.MultiClusterController.List(cluster)
 		if err != nil {
 			klog.Errorf("error listing namespaces from cluster %s informer cache: %v", cluster, err)
-			blockedClusterSet.Insert(cluster)
+			knownClusterSet.Delete(cluster)
 			continue
 		}
 		vList := listObj.(*v1.NamespaceList)
@@ -137,24 +138,62 @@ func (c *controller) PatrollerDo() {
 		if c.shouldBeGarbageCollected(p) || p.Annotations[constants.LabelUID] != string(v.UID) {
 			c.deleteNamespace(p)
 		}
+		// update namespace meta is a generic operation, guarded by SuperClusterPooling for now
+		if featuregate.DefaultFeatureGate.Enabled(featuregate.SuperClusterPooling) {
+			vc, err := util.GetVirtualClusterObject(c.MultiClusterController, vObj.GetOwnerCluster())
+			if err != nil {
+				klog.Errorf("fail to get cluster spec : %s", vObj.GetOwnerCluster())
+				return
+			}
+			updatedNamespace := conversion.Equality(c.Config, vc).CheckNamespaceEquality(p, v)
+			if updatedNamespace != nil {
+				klog.Warningf("metadata of namespace %s diff in super&tenant cluster", pObj.Key)
+				d.OnAdd(vObj)
+			}
+		}
 	}
 	d.DeleteFunc = func(pObj differ.ClusterObject) {
 		p := pObj.Object.(*v1.Namespace)
+
+		// only delete the root ns if vc is gone
 		if p.Annotations[constants.LabelVCRootNS] == "true" {
-			if !c.shouldBeGarbageCollected(p) {
-				return
+			if c.shouldBeGarbageCollected(p) {
+				c.deleteNamespace(p)
 			}
+			return
 		}
-		c.deleteNamespace(p)
+		clusterName, _ := conversion.GetVirtualOwner(p)
+		// most possible case. vc is loaded and tenant ns is missing
+		if knownClusterSet.Has(clusterName) {
+			c.deleteNamespace(p)
+			return
+		}
+
+		// vc status is unknown or not loaded. confirm for gc purpose
+		if c.shouldBeGarbageCollected(p) {
+			c.deleteNamespace(p)
+			return
+		}
 	}
 
 	vSet.Difference(pSet, differ.FilteringHandler{
 		Handler: d,
 		FilterFunc: func(obj differ.ClusterObject) bool {
+			// vObj
+			if obj.OwnerCluster != "" {
+				return true
+			}
+
 			if obj.OwnerCluster == "" && obj.GetAnnotations()[constants.LabelVCRootNS] == "true" {
 				return true
 			}
-			return differ.DefaultDifferFilter(blockedClusterSet)(obj)
+
+			// pObj
+			clusterName, vNamespace := conversion.GetVirtualOwner(obj)
+			if clusterName != "" && vNamespace != "" {
+				return true
+			}
+			return false
 		},
 	})
 }

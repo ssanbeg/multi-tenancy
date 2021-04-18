@@ -33,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
+	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
 	clientgocache "k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
@@ -49,6 +50,7 @@ import (
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/fairqueue"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/handler"
 	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/reconciler"
+	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/util/record"
 )
 
 // MultiClusterController implements the multicluster controller pattern.
@@ -149,6 +151,7 @@ func NewMCController(objectType, objectListType runtime.Object, rc reconciler.DW
 // WatchOptions is used as an argument of WatchResource methods (just a placeholder for now).
 // TODO: consider implementing predicates.
 type WatchOptions struct {
+	AttachUID bool // the object UID will be added to the reconciler request if it is true
 }
 
 // WatchClusterResource configures the Controller to watch resources of the same Kind as objectType,
@@ -165,7 +168,7 @@ func (c *MultiClusterController) WatchClusterResource(cluster ClusterInterface, 
 		return nil
 	}
 
-	h := &handler.EnqueueRequestForObject{ClusterName: cluster.GetClusterName(), Queue: c.Queue}
+	h := &handler.EnqueueRequestForObject{ClusterName: cluster.GetClusterName(), Queue: c.Queue, AttachUID: o.AttachUID}
 	return cluster.AddEventHandler(c.objectType, h)
 }
 
@@ -224,7 +227,7 @@ func (c *MultiClusterController) GetObjectKind() string {
 
 // Get returns object with specific cluster, namespace and name.
 func (c *MultiClusterController) Get(clusterName, namespace, name string) (interface{}, error) {
-	cluster := c.getCluster(clusterName)
+	cluster := c.GetCluster(clusterName)
 	if cluster == nil {
 		return nil, errors.NewClusterNotFound(clusterName)
 	}
@@ -242,7 +245,7 @@ func (c *MultiClusterController) Get(clusterName, namespace, name string) (inter
 
 // GetByObjectType returns object with specific cluster, namespace and name and object type
 func (c *MultiClusterController) GetByObjectType(clusterName, namespace, name string, objectType runtime.Object) (interface{}, error) {
-	cluster := c.getCluster(clusterName)
+	cluster := c.GetCluster(clusterName)
 	if cluster == nil {
 		return nil, errors.NewClusterNotFound(clusterName)
 	}
@@ -263,7 +266,7 @@ func (c *MultiClusterController) GetByObjectType(clusterName, namespace, name st
 
 // List returns a list of objects with specific cluster.
 func (c *MultiClusterController) List(clusterName string, opts ...client.ListOption) (interface{}, error) {
-	cluster := c.getCluster(clusterName)
+	cluster := c.GetCluster(clusterName)
 	if cluster == nil {
 		return nil, errors.NewClusterNotFound(clusterName)
 	}
@@ -278,7 +281,7 @@ func (c *MultiClusterController) List(clusterName string, opts ...client.ListOpt
 
 // ListByObjectType returns a list of objects with specific cluster and object type.
 func (c *MultiClusterController) ListByObjectType(clusterName string, objectType runtime.Object, opts ...client.ListOption) (interface{}, error) {
-	cluster := c.getCluster(clusterName)
+	cluster := c.GetCluster(clusterName)
 	if cluster == nil {
 		return nil, errors.NewClusterNotFound(clusterName)
 	}
@@ -294,7 +297,7 @@ func (c *MultiClusterController) ListByObjectType(clusterName string, objectType
 	return instanceList, err
 }
 
-func (c *MultiClusterController) getCluster(clusterName string) ClusterInterface {
+func (c *MultiClusterController) GetCluster(clusterName string) ClusterInterface {
 	c.Lock()
 	defer c.Unlock()
 	return c.clusters[clusterName]
@@ -302,7 +305,7 @@ func (c *MultiClusterController) getCluster(clusterName string) ClusterInterface
 
 // GetClusterClient returns the cluster's clientset client for direct access to tenant apiserver
 func (c *MultiClusterController) GetClusterClient(clusterName string) (clientset.Interface, error) {
-	cluster := c.getCluster(clusterName)
+	cluster := c.GetCluster(clusterName)
 	if cluster == nil {
 		return nil, errors.NewClusterNotFound(clusterName)
 	}
@@ -310,7 +313,7 @@ func (c *MultiClusterController) GetClusterClient(clusterName string) (clientset
 }
 
 func (c *MultiClusterController) GetClusterObject(clusterName string) (runtime.Object, error) {
-	cluster := c.getCluster(clusterName)
+	cluster := c.GetCluster(clusterName)
 	if cluster == nil {
 		return nil, errors.NewClusterNotFound(clusterName)
 	}
@@ -322,7 +325,7 @@ func (c *MultiClusterController) GetClusterObject(clusterName string) (runtime.O
 }
 
 func (c *MultiClusterController) GetOwnerInfo(clusterName string) (string, string, string, error) {
-	cluster := c.getCluster(clusterName)
+	cluster := c.GetCluster(clusterName)
 	if cluster == nil {
 		return "", "", "", errors.NewClusterNotFound(clusterName)
 	}
@@ -352,7 +355,6 @@ func (c *MultiClusterController) GetClusterNames() []string {
 // 'message' is intended to be human readable.
 //
 // The resulting event will be created in the same namespace as the reference object.
-// TODO(zhuangqh): consider maintain an event sink for each tenant.
 func (c *MultiClusterController) Eventf(clusterName string, ref *v1.ObjectReference, eventtype string, reason, messageFmt string, args ...interface{}) error {
 	tenantClient, err := c.GetClusterClient(clusterName)
 	if err != nil {
@@ -368,6 +370,10 @@ func (c *MultiClusterController) Eventf(clusterName string, ref *v1.ObjectRefere
 			Name:      fmt.Sprintf("%v.%x", ref.Name, eventTime.UnixNano()),
 			Namespace: namespace,
 		},
+		Source: v1.EventSource{
+			Host: clusterName,
+		},
+		Count:               1, // the count needs to be set for event sinker to work
 		InvolvedObject:      *ref,
 		Type:                eventtype,
 		Reason:              reason,
@@ -376,8 +382,9 @@ func (c *MultiClusterController) Eventf(clusterName string, ref *v1.ObjectRefere
 		LastTimestamp:       eventTime,
 		ReportingController: "vc-syncer",
 	}
-	_, err = tenantClient.CoreV1().Events(namespace).Create(context.TODO(), event, metav1.CreateOptions{})
-	return err
+
+	sink := &v1core.EventSinkImpl{Interface: tenantClient.CoreV1().Events(namespace)}
+	return record.EventSinkerInstance.RecordToSink(sink, event)
 }
 
 // RequeueObject requeues the cluster object, thus reconcileHandler can reconcile it again.
@@ -387,11 +394,10 @@ func (c *MultiClusterController) RequeueObject(clusterName string, obj interface
 		return err
 	}
 
-	cluster := c.getCluster(clusterName)
+	cluster := c.GetCluster(clusterName)
 	if cluster == nil {
 		return errors.NewClusterNotFound(clusterName)
 	}
-	//FIXME: we dont need event here.
 	r := reconciler.Request{}
 	r.ClusterName = clusterName
 	r.Namespace = o.GetNamespace()
@@ -442,7 +448,7 @@ func (c *MultiClusterController) processNextWorkItem() bool {
 		// Return true, don't take a break
 		return true
 	}
-	if c.getCluster(req.ClusterName) == nil {
+	if c.GetCluster(req.ClusterName) == nil {
 		// The virtual cluster has been removed, do not reconcile for its dws requests.
 		klog.Warningf("The cluster %s has been removed, drop the dws request %v", req.ClusterName, req)
 		c.Queue.Forget(obj)

@@ -23,6 +23,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
 	"strings"
 
 	"github.com/pkg/errors"
@@ -213,6 +214,12 @@ func BuildVirtualPriorityClass(cluster string, pPriorityClass *v1scheduling.Prio
 	return vPriorityClass
 }
 
+func BuildVirtualCRD(cluster string, pCRD *v1beta1.CustomResourceDefinition) *v1beta1.CustomResourceDefinition {
+	vCRD := pCRD.DeepCopy()
+	ResetMetadata(vCRD)
+	return vCRD
+}
+
 func BuildVirtualPersistentVolume(cluster, vcNS, vcName string, pPV *v1.PersistentVolume, vPVC *v1.PersistentVolumeClaim) *v1.PersistentVolume {
 	vPVobj, _ := BuildMetadata(cluster, vcNS, vcName, "", pPV)
 	vPV := vPVobj.(*v1.PersistentVolume)
@@ -235,5 +242,11 @@ func IsControlPlaneService(service *v1.Service, cluster string) bool {
 		kubernetesService = "apiserver-svc"
 	}
 
+	// If the super cluster pooling is enabled, the service in tenant default namepsace
+	// is used.
+	if featuregate.DefaultFeatureGate.Enabled(featuregate.SuperClusterPooling) {
+		kubernetesNamespace = metav1.NamespaceDefault
+		kubernetesService = "kubernetes"
+	}
 	return service.Namespace == kubernetesNamespace && service.Name == kubernetesService
 }

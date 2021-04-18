@@ -69,7 +69,7 @@ func GetClientFromSecret(metaClient clientset.Interface, name, namespace string)
 func GetSuperClusterID(client clientset.Interface) (string, error) {
 	cfg, err := client.CoreV1().ConfigMaps("kube-system").Get(context.TODO(), utilconst.SuperClusterInfoCfgMap, metav1.GetOptions{})
 	if err != nil {
-		return "", fmt.Errorf("failed to get super cluster info configmap in kube-system")
+		return "", fmt.Errorf("failed to get super cluster info configmap in kube-system: %v", err)
 	}
 	id, ok := cfg.Data[utilconst.SuperClusterIDKey]
 	if !ok {
@@ -289,6 +289,11 @@ func GetSchedulingInfo(namespace *v1.Namespace) (map[string]int, v1.ResourceList
 	return placements, quotaSlice, nil
 }
 
+func GetPodSchedulingInfo(pod *v1.Pod) string {
+	cluster, _ := pod.GetAnnotations()[utilconst.LabelScheduledCluster]
+	return cluster
+}
+
 func SyncVirtualClusterState(metaClient clientset.Interface, vc *v1alpha1.VirtualCluster, cache internalcache.Cache) error {
 	clustername := conversion.ToClusterKey(vc)
 	cache.AddTenant(clustername)
@@ -367,7 +372,7 @@ func SyncVirtualClusterState(metaClient clientset.Interface, vc *v1alpha1.Virtua
 				// TODO: Pod scheduling result is inconsistent, we need to delete the Pod or send warnings.
 				continue
 			}
-			cPod := internalcache.NewPod(clustername, each.Name, pod.Name, string(pod.UID), supercluster, GetPodRequirements(&pod))
+			cPod := internalcache.NewPod(clustername, each.Name, pod.Name, supercluster, GetPodRequirements(&pod))
 			// If the pod already exists, AddPod will update the cache with latest schedule.
 			if err := cache.AddPod(cPod); err != nil {
 				return fmt.Errorf("failed to add pod to cache: %s/%s/%s with error %v", clustername, each.Name, pod.Name, err)

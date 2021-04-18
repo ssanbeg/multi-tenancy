@@ -18,17 +18,16 @@ package native
 
 import (
 	v1 "k8s.io/api/core/v1"
-
-	"sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/vnode"
+	vnodeprovider "sigs.k8s.io/multi-tenancy/incubator/virtualcluster/pkg/syncer/vnode/provider"
 )
 
 type provider struct {
 	vnAgentPort int32
 }
 
-var _ vnode.VirtualNodeProvider = &provider{}
+var _ vnodeprovider.VirtualNodeProvider = &provider{}
 
-func NewNativeVirtualNodeProvider(vnAgentPort int32) vnode.VirtualNodeProvider {
+func NewNativeVirtualNodeProvider(vnAgentPort int32) vnodeprovider.VirtualNodeProvider {
 	return &provider{vnAgentPort: vnAgentPort}
 }
 
