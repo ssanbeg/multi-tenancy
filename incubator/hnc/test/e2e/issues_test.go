@@ -215,7 +215,10 @@ var _ = Describe("Issues", func() {
 		MustRun("kubectl delete subns", nsChild, "-n", nsParent)
 	})
 
-	It("Should have CannotPropagateObject and CannotUpdateObject events - replacing obsolete issues #328, #605, #771", func() {
+	// Disabled due to https://github.com/kubernetes-sigs/multi-tenancy/issues/1492 - now that HNC
+	// *can* propagate cluster-admin rolebindings (see the test for #772), we need to find some new
+	// way to test what HNC does when it *can't* propagate something.
+	XIt("Should have CannotPropagateObject and CannotUpdateObject events - replacing obsolete issues #328, #605, #771", func() {
 		// Set up
 		CreateNamespace(nsParent)
 		CreateNamespace(nsChild)
@@ -227,13 +230,13 @@ var _ = Describe("Issues", func() {
 		RunShouldContain("Could not write from source namespace \""+nsParent+"\"", defTimeout, "kubectl get events -n", nsChild, "--field-selector reason=CannotUpdateObject")
 	})
 
-	It("Should propogate admin rolebindings - issue #772", func() {
+	It("Should propagate cluster-admin rolebindings - issue #772, #1311", func() {
 		// set up
 		CreateNamespace(nsParent)
 		CreateNamespace(nsChild)
 		MustRun("kubectl hns set", nsChild, "--parent", nsParent)
 		// Creating admin rolebinding object
-		MustRun("kubectl create rolebinding --clusterrole=admin --serviceaccount=default:default -n", nsParent, "foo")
+		MustRun("kubectl create rolebinding --clusterrole=cluster-admin --serviceaccount=default:default -n", nsParent, "foo")
 		// Object should exist in the child, and there should be no conditions
 		MustRun("kubectl get rolebinding foo -n", nsChild, "-oyaml")
 	})

@@ -180,12 +180,23 @@ controller-gen:
 
 # Deploy controller in the configured Kubernetes cluster in ~/.kube/config.
 #
-# We only delete and redeploy the deployment, and nothing else, because a)
-# deleting the CRDs will cause all the existing hierarchy configs to be wiped
-# away and b) if we don't delete the deployment, a new image won't be pulled
-# unless the tag changes.
+# We only delete the deployment and the validatingwebhookconfiguration if they
+# exist before applying the manifest, because
+# a) deleting the CRDs will cause all the existing CRs to be wiped away;
+# b) if not deleting the deployment, a new image won't be pulled unless the tag changes;
+# c) if not deleting the validatingwebhookconfiguration, we cannot label
+#    namespaces to exclude them if the HNC pod is already in a bad state.
+#
+# Then we ensure the system namespaces are excluded before we deploy HNC. This
+# step is critical because if the HNC pod is ever in a bad state, the object
+# webhook service would not respond and would stop everything in the system
+# namespaces, such as "kube-system", thus breaking the whole cluster.
 deploy: docker-push kubectl manifests
 	-kubectl -n hnc-system delete deployment hnc-controller-manager
+	-kubectl delete validatingwebhookconfiguration hnc-validating-webhook-configuration
+	-kubectl label ns kube-node-lease hnc.x-k8s.io/excluded-namespace=true --overwrite
+	-kubectl label ns kube-public hnc.x-k8s.io/excluded-namespace=true --overwrite
+	-kubectl label ns kube-system hnc.x-k8s.io/excluded-namespace=true --overwrite
 	kubectl apply -f manifests/${HNC_IMG_NAME}.yaml
 
 deploy-watch:
@@ -246,22 +257,76 @@ kind-deploy:
 # Note the `-timeout 0` that's passed to the `go test` command - by default, a
 # Go test suite has a 10m timeout, and the flag disables that timeout (as of
 # July 2020, these tests take ~15m and that number is expected to grow).
+#
+# To focus on specific tests, use the HNC_FOCUS var as follows:
+#
+# HNC_FOCUS=772 make test-e2e # only runs the test for issue 772
+# HNC_FOCUS=Quickstart make test-e2e # Runs all tests in the "Quickstart" Describe block
 .PHONY: test-e2e
-test-e2e:
+test-e2e: warn-hnc-repair exclude-system-namespaces
+	go clean -testcache
+ifndef HNC_FOCUS
+	go test -v -timeout 0 ./test/e2e/...
+else
+	go test -v -timeout 0 ./test/e2e/... -args --ginkgo.focus ${HNC_FOCUS}
+endif
+
+# This batch test will run e2e tests N times on the current cluster the user
+# deployed (either kind or a kubernetes cluster), e.g. "make test-e2e-batch N=10"
+.PHONY: test-e2e-batch
+test-e2e-batch: warn-hnc-repair exclude-system-namespaces
+	number=1 ; while [[ $$number -le $N ]] ; do \
+		echo $$number ; \
+    ((number = number + 1)) ; \
+		go clean -testcache ; \
+		go test -v -timeout 0 ./test/e2e/... ; \
+	done
+
+# This will *only* run a small number of tests (specifically, the quickstarts). You can run this when you're fairly confident that
+# everything will work, but be sure to watch for the postsubmits and periodic tests to ensure they pass too.
+.PHONY: test-smoke
+test-smoke: exclude-system-namespaces
+	go clean --testcache
+	go test -v -timeout 0 ./test/e2e/... -args --ginkgo.focus "Quickstart"
+
+# exclude-system-namespaces is called before we run any e2e tests. We do ensure
+# the system namespaces are excluded in the "deploy" target. However, we need to
+# do it here too in case users install HNC by applying manifests. Ensuring the
+# system namespaces excluded is critical, because otherwise when HNC pod is in a
+# bad state, the whole cluster will break.
+exclude-system-namespaces:
+	@echo
+	@echo "Ensuring all system namespaces are excluded from HNC..."
+	@kubectl label ns hnc-system hnc.x-k8s.io/excluded-namespace=true --overwrite
+	@kubectl label ns kube-node-lease hnc.x-k8s.io/excluded-namespace=true --overwrite
+	@kubectl label ns kube-public hnc.x-k8s.io/excluded-namespace=true --overwrite
+	@kubectl label ns kube-system hnc.x-k8s.io/excluded-namespace=true --overwrite
 	@echo
 	@echo "If these tests fail due to the webhook not being ready, wait 30s and try again. Note that webhooks can take up to 30s to become ready"
 	@echo "after HNC is first deployed in a cluster."
 	@echo
+
+warn-hnc-repair:
+	@echo "************************************************************"
 ifndef HNC_REPAIR
-	@echo "******************************************************"
 	@echo "HNC_REPAIR IS NOT SET. CRITICAL TESTS WILL BE SKIPPED."
-	@echo "You have 5s to hit Ctrl-C to cancel and try again."
-	@echo "******************************************************"
 	@echo
-	@sleep 5
+	@echo "If HNC is installed via an operator (e.g. GKE Hierarchy"
+	@echo "Controller), this is probably what you want to do. Otherwise,"
+	@echo "consider setting HNC_REPAIR to run the full set of tests."
+else
+	@echo "HNC_REPAIR IS SET; ENSURE YOU HAVE PERMISSION TO MODIFY HNC"
+	@echo "CONFIGS."
+	@echo
+	@echo "If HNC is installed via an operator (e.g. GKE Hierarchy"
+	@echo "Controller), these tests will fail and your cluster could"
+	@echo "be left in a bad state."
 endif
-	go clean -testcache
-	go test -v -timeout 0 ./test/e2e/...
+	@echo
+	@echo "You have 3s to hit Ctrl-C to cancel..."
+	@echo "************************************************************"
+	@echo
+	@sleep 3
 
 ###################### RELEASE ACTIONS #########################
 # Build the container image by Cloud Build and build YAMLs locally
@@ -305,7 +370,7 @@ endif
 	@echo "Starting build."
 	@echo "*********************************************"
 	@echo "*********************************************"
-	gcloud builds submit --config cloudbuild.yaml --no-source --substitutions=${HNC_GCB_SUBS}
+	gcloud builds submit --config cloudbuild.yaml --no-source --substitutions=${HNC_GCB_SUBS} --timeout=30m
 	@echo "*********************************************"
 	@echo "*********************************************"
 	@echo "Pushing ${HNC_IMG} to ${HNC_RELEASE_IMG}"

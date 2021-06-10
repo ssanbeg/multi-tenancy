@@ -1,4 +1,10 @@
 # HNC: Quickstarts
+
+***[UPDATE MAY 2021]: HNC has graduated to its [own
+repo](https://github.com/kubernetes-sigs/hierarchical-namespaces)! Please visit
+that repo for the [latest version of this user
+guide](https://github.com/kubernetes-sigs/hierarchical-namespaces/tree/master/docs/user-guide/quickstart.md).***
+
 _Part of the [HNC User Guide](README.md)_
 
 This document walks you through some common ways to use hierarchical namespaces.
@@ -630,7 +636,7 @@ also show up in the HNC logs, and in its [metrics](how-to.md#admin-metrics).
 
 <a name="exceptions"/>
 
-## Keeping objects out of certain namespaces (v0.7 only)
+## Keeping objects out of certain namespaces
 
 _Demonstrates: exceptions_
 

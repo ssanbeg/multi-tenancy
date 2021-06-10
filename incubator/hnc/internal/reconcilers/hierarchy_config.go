@@ -85,16 +85,20 @@ type HierarchyConfigReconciler struct {
 
 // Reconcile sets up some basic variables and then calls the business logic.
 func (r *HierarchyConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	if config.ExcludedNamespaces[req.Namespace] {
-		return ctrl.Result{}, nil
+	ns := req.NamespacedName.Namespace
+	log := loggerWithRID(r.Log).WithValues("ns", ns)
+
+	// Always delete hierarchyconfiguration (and any other HNC CRs) in the
+	// excluded namespaces and early exit.
+	if config.ExcludedNamespaces[ns] {
+		// Since singletons in the excluded namespaces are never synced by HNC, there
+		// are no finalizers on the singletons that we can delete them without
+		// removing the finalizers first.
+		return ctrl.Result{}, r.deleteSingletonIfExists(ctx, log, ns)
 	}
 
 	stats.StartHierConfigReconcile()
 	defer stats.StopHierConfigReconcile()
-
-	ns := req.NamespacedName.Namespace
-
-	log := loggerWithRID(r.Log).WithValues("ns", ns)
 
 	return ctrl.Result{}, r.reconcile(ctx, log, ns)
 }
@@ -140,13 +144,13 @@ func (r *HierarchyConfigReconciler) reconcile(ctx context.Context, log logr.Logg
 	r.updateFinalizers(ctx, log, inst, nsInst, anms)
 
 	// Sync the Hierarchy singleton with the in-memory forest.
-	initial := r.syncWithForest(log, nsInst, inst, deletingCRD, anms)
+	needUpdateObjects := r.syncWithForest(log, nsInst, inst, deletingCRD, anms)
 
 	// Write back if anything's changed. Early-exit if we just write back exactly what we had and this
 	// isn't the first time we're syncing.
 	updated, err := r.writeInstances(ctx, log, origHC, inst, origNS, nsInst)
-	updated = updated || initial
-	if !updated || err != nil {
+	needUpdateObjects = updated || needUpdateObjects
+	if !needUpdateObjects || err != nil {
 		return err
 	}
 
@@ -219,7 +223,8 @@ func (r *HierarchyConfigReconciler) updateFinalizers(ctx context.Context, log lo
 // guarded by the forest mutex, which means that none of the other namespaces being reconciled will
 // be able to proceed until this one is finished. While the results of the reconiliation may not be
 // fully written back to the apiserver yet, each namespace is reconciled in isolation (apart from
-// the in-memory forest) so this is fine.
+// the in-memory forest) so this is fine. Return true, if the namespace is just synced or the
+// namespace labels are changed that requires updating all objects in the namespaces.
 func (r *HierarchyConfigReconciler) syncWithForest(log logr.Logger, nsInst *corev1.Namespace, inst *api.HierarchyConfiguration, deletingCRD bool, anms []string) bool {
 	r.Forest.Lock()
 	defer r.Forest.Unlock()
@@ -253,9 +258,9 @@ func (r *HierarchyConfigReconciler) syncWithForest(log logr.Logger, nsInst *core
 	r.syncConditions(log, inst, ns, deletingCRD, hadCrit)
 
 	// Sync the tree labels. This should go last since it can depend on the conditions.
-	r.syncLabel(log, nsInst, ns)
+	nsCustomerLabelUpdated := r.syncLabel(log, nsInst, ns)
 
-	return initial
+	return initial || nsCustomerLabelUpdated
 }
 
 // syncExternalNamespace sets external tree labels to the namespace in the forest
@@ -373,8 +378,11 @@ func (r *HierarchyConfigReconciler) syncParent(log logr.Logger, inst *api.Hierar
 
 	// Sync this namespace with its current parent.
 	curParent := r.Forest.Get(inst.Spec.Parent)
-	if curParent != nil && !curParent.Exists() {
-		log.Info("The parent doesn't appear to exist (or hasn't been synced yet)", "parent", inst.Spec.Parent)
+	if config.ExcludedNamespaces[inst.Spec.Parent] {
+		log.Info("Setting ConditionActivitiesHalted: excluded namespace set as parent", "parent", inst.Spec.Parent)
+		ns.SetCondition(api.ConditionActivitiesHalted, api.ReasonIllegalParent, fmt.Sprintf("Parent %q is an excluded namespace", inst.Spec.Parent))
+	} else if curParent != nil && !curParent.Exists() {
+		log.Info("Setting ConditionActivitiesHalted: parent doesn't exist (or hasn't been synced yet)", "parent", inst.Spec.Parent)
 		ns.SetCondition(api.ConditionActivitiesHalted, api.ReasonParentMissing, fmt.Sprintf("Parent %q does not exist", inst.Spec.Parent))
 	}
 
@@ -413,10 +421,11 @@ func (r *HierarchyConfigReconciler) syncAnchors(log logr.Logger, ns *forest.Name
 	}
 }
 
-func (r *HierarchyConfigReconciler) syncLabel(log logr.Logger, nsInst *corev1.Namespace, ns *forest.Namespace) {
+// Sync namespace tree labels and other labels. Return true if the labels are updated.
+func (r *HierarchyConfigReconciler) syncLabel(log logr.Logger, nsInst *corev1.Namespace, ns *forest.Namespace) bool {
 	if ns.IsExternal() {
 		metadata.SetLabel(nsInst, nsInst.Name+api.LabelTreeDepthSuffix, "0")
-		return
+		return false
 	}
 
 	// Remove all existing depth labels.
@@ -454,7 +463,11 @@ func (r *HierarchyConfigReconciler) syncLabel(log logr.Logger, nsInst *corev1.Na
 	}
 	// Update the labels in the forest so that we can quickly access the labels and
 	// compare if they match the given selector
-	ns.SetLabels(nsInst.Labels)
+	if ns.SetLabels(nsInst.Labels) {
+		log.Info("Namespace labels have been updated.")
+		return true
+	}
+	return false
 }
 
 func (r *HierarchyConfigReconciler) syncConditions(log logr.Logger, inst *api.HierarchyConfiguration, ns *forest.Namespace, deletingCRD, hadCrit bool) {
@@ -579,6 +592,37 @@ func (r *HierarchyConfigReconciler) writeHierarchy(ctx context.Context, log logr
 	}
 
 	return true, nil
+}
+
+// deleteSingletonIfExists deletes the singleton in the namespace if it exists.
+// Note: Make sure there's no finalizers on the singleton before calling this
+// function.
+func (r *HierarchyConfigReconciler) deleteSingletonIfExists(ctx context.Context, log logr.Logger, nm string) error {
+	inst, deletingCRD, err := r.getSingleton(ctx, nm)
+	if err != nil {
+		return err
+	}
+
+	// Early exit if the singleton doesn't exist.
+	if inst.CreationTimestamp.IsZero() {
+		return nil
+	}
+
+	// If the CRD is being deleted, we don't need to delete it separately. It will
+	// be deleted with the CRD.
+	if deletingCRD {
+		log.Info("HC in excluded namespace is already being deleted")
+		return nil
+	}
+	log.Info("Deleting illegal HC in excluded namespace")
+
+	stats.WriteHierConfig()
+	if err := r.Delete(ctx, inst); err != nil {
+		log.Error(err, "while deleting on apiserver")
+		return err
+	}
+
+	return nil
 }
 
 func (r *HierarchyConfigReconciler) writeNamespace(ctx context.Context, log logr.Logger, orig, inst *corev1.Namespace) (bool, error) {

@@ -51,6 +51,17 @@ func getHierarchy(ctx context.Context, nm string) *api.HierarchyConfiguration {
 	return hier
 }
 
+func canGetHierarchy(ctx context.Context, nm string) func() bool {
+	return func() bool {
+		nnm := types.NamespacedName{Namespace: nm, Name: api.Singleton}
+		hier := &api.HierarchyConfiguration{}
+		if err := k8sClient.Get(ctx, nnm, hier); err != nil {
+			return false
+		}
+		return true
+	}
+}
+
 func updateHierarchy(ctx context.Context, h *api.HierarchyConfiguration) {
 	if h.CreationTimestamp.IsZero() {
 		ExpectWithOffset(1, k8sClient.Create(ctx, h)).Should(Succeed())
@@ -95,6 +106,22 @@ func createNSes(ctx context.Context, num int) []string {
 		nms = append(nms, nm)
 	}
 	return nms
+}
+
+func addNamespaceLabel(ctx context.Context, nm, k, v string) {
+	ns := getNamespace(ctx, nm)
+	l := ns.Labels
+	l[k] = v
+	ns.SetLabels(l)
+	updateNamespace(ctx, ns)
+}
+
+func removeNamespaceLabel(ctx context.Context, nm, k string) {
+	ns := getNamespace(ctx, nm)
+	l := ns.Labels
+	delete(l, k)
+	ns.SetLabels(l)
+	updateNamespace(ctx, ns)
 }
 
 func updateNamespace(ctx context.Context, ns *corev1.Namespace) {
